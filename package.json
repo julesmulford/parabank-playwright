@@ -1,0 +1,46 @@
+{
+    "name": "playwright-tests",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "test": "playwright test",
+        "test:headed": "playwright test --headed",
+        "test:ui": "playwright test --ui",
+        "test:debug": "playwright test --debug",
+        "test:smoke": "playwright test --grep @smoke",
+        "report": "playwright show-report",
+        "test:chromium": "playwright test --project=chromium",
+        "test:firefox": "playwright test --project=firefox",
+        "test:webkit": "playwright test --project=webkit",
+        "test:staging": "cross-env TEST_ENV=staging playwright test",
+        "test:qa": "cross-env TEST_ENV=qa playwright test",
+        "test:production": "cross-env TEST_ENV=production playwright test"
+    },
+    "devDependencies": {
+        "@playwright/test": "^1.59.1",
+        "@types/node": "^20",
+        "cross-env": "^10.1.0",
+        "dotenv": "^16.6.1",
+        "typescript": "^5.9.3"
+    },
+    "version": "1.0.0",
+    "description": "Install playwright:\r npm install\r npx playwright install",
+    "main": "index.js",
+    "directories": {
+        "test": "tests"
+    },
+    "dependencies": {
+        "cross-spawn": "^7.0.6",
+        "isexe": "^2.0.0",
+        "path-key": "^3.1.1",
+        "playwright": "^1.59.1",
+        "playwright-core": "^1.59.1",
+        "shebang-command": "^2.0.0",
+        "shebang-regex": "^3.0.0",
+        "undici-types": "^6.21.0",
+        "which": "^2.0.2"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC"
+}
