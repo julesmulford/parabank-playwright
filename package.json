@@ -21,7 +21,8 @@
         "@types/node": "^20",
         "cross-env": "^10.1.0",
         "dotenv": "^16.6.1",
-        "typescript": "^5.9.3"
+        "typescript": "^5.9.3",
+        "wait-on": "^9.0.5"
     },
     "version": "1.0.0",
     "description": "Install playwright:\r npm install\r npx playwright install",

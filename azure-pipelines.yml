@@ -20,7 +20,7 @@ pool:
 
 variables:
   NODE_VERSION: '20.x'
-  BASE_URL: 'https://your-app-url.com'  # Replace with your app URL
+  BASE_URL: 'http://localhost:3000/parabank/'
 
 stages:
   - stage: Test
@@ -31,24 +31,37 @@ stages:
         timeoutInMinutes: 30  # Hard cap to protect free tier minutes
 
         steps:
-          # 1. Set up Node
+          # 1. Start Parabank container
+          - script: |
+              docker pull parasoft/parabank
+              docker run -d -p 3000:8080 --name parabank parasoft/parabank
+            displayName: 'Start Parabank Docker container'
+
+          # 2. Initialise the database
+          - script: |
+              echo "Waiting for Parabank to start..."
+              npx wait-on http://localhost:3000/parabank/ --timeout 60000
+              curl -X POST http://localhost:3000/parabank/services/bank/initializeDB
+            displayName: 'Initialise Parabank database'
+
+          # 3. Set up Node
           - task: NodeTool@0
             inputs:
               versionSpec: $(NODE_VERSION)
             displayName: 'Install Node.js'
 
-          # 2. Install dependencies
+          # 4. Install dependencies
           - script: npm ci
             displayName: 'Install npm dependencies'
 
-          # 3. Install Playwright browsers
+          # 5. Install Playwright browsers
           #    --with-deps installs OS-level dependencies too
           - script: npx playwright install chromium --with-deps
             displayName: 'Install Playwright browsers'
             # NOTE: chromium only — installing all browsers would be slow
             # and burn free tier minutes. Add firefox/webkit only if needed.
 
-          # 4. Run tests
+          # 6. Run tests
           - script: npx playwright test
             displayName: 'Run Playwright tests'
             env:
@@ -65,11 +78,18 @@ stages:
               publishLocation: pipeline
             condition: always()  # Always publish so you can see failures
 
-          # 6. Publish JUnit XML results so Azure shows pass/fail per test
+          # 7. Publish JUnit XML results so Azure shows pass/fail per test
           - task: PublishTestResults@2
             displayName: 'Publish Test Results'
             inputs:
               testResultsFormat: JUnit
               testResultsFiles: test-results/**/*.xml
               failTaskOnFailedTests: true
+            condition: always()
+
+          # 8. Stop and remove Parabank container (prevents conflicts on next run)
+          - script: |
+              docker stop parabank || true
+              docker rm parabank || true
+            displayName: 'Teardown Parabank container'
             condition: always()
