@@ -1,0 +1,75 @@
+# ============================================================
+# Azure DevOps Pipeline — Playwright Test Suite
+# Free tier safe: uses 1 Microsoft-hosted agent (no parallelism)
+# Estimated usage: ~10-15 mins per run / 1,800 mins free/month
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest  # Free Microsoft-hosted agent
+
+variables:
+  NODE_VERSION: '20.x'
+  BASE_URL: 'https://your-app-url.com'  # Replace with your app URL
+
+stages:
+  - stage: Test
+    displayName: 'Playwright Tests'
+    jobs:
+      - job: PlaywrightTests
+        displayName: 'Run Playwright Suite'
+        timeoutInMinutes: 30  # Hard cap to protect free tier minutes
+
+        steps:
+          # 1. Set up Node
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(NODE_VERSION)
+            displayName: 'Install Node.js'
+
+          # 2. Install dependencies
+          - script: npm ci
+            displayName: 'Install npm dependencies'
+
+          # 3. Install Playwright browsers
+          #    --with-deps installs OS-level dependencies too
+          - script: npx playwright install chromium --with-deps
+            displayName: 'Install Playwright browsers'
+            # NOTE: chromium only — installing all browsers would be slow
+            # and burn free tier minutes. Add firefox/webkit only if needed.
+
+          # 4. Run tests
+          - script: npx playwright test
+            displayName: 'Run Playwright tests'
+            env:
+              BASE_URL: $(BASE_URL)
+            continueOnError: true  # Ensures artifacts are published even on failure
+
+          # 5. Publish HTML report as pipeline artifact
+          #    Viewable in the Azure DevOps UI under the build summary
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Playwright HTML Report'
+            inputs:
+              targetPath: playwright-report
+              artifact: playwright-report
+              publishLocation: pipeline
+            condition: always()  # Always publish so you can see failures
+
+          # 6. Publish JUnit XML results so Azure shows pass/fail per test
+          - task: PublishTestResults@2
+            displayName: 'Publish Test Results'
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: test-results/**/*.xml
+              failTaskOnFailedTests: true
+            condition: always()

@@ -1,0 +1,90 @@
+# ============================================================
+# CircleCI — Playwright Test Suite (.circleci/config.yml)
+# Free tier safe: 6,000 credits/month on free plan
+# Uses resource_class: medium (5 credits/min) = ~20 mins/run
+# Estimated: 100 credits per run — leaves plenty of headroom
+# ============================================================
+
+version: 2.1
+
+# Reusable executor using the official Playwright Docker image.
+# This image has all browsers + OS dependencies pre-installed,
+# which saves significant build time vs installing from scratch.
+executors:
+  playwright:
+    docker:
+      # Official Microsoft Playwright image with Node 20 + Chromium
+      # Using a pinned version for reproducibility
+      - image: mcr.microsoft.com/playwright:v1.42.0-jammy
+        environment:
+          NODE_ENV: test
+          BASE_URL: https://your-app-url.com  # Replace with your app URL
+    # resource_class: medium = 2 vCPUs, 4GB RAM
+    # This is the free-tier-safe choice — do NOT use large or xlarge
+    resource_class: medium
+    working_directory: ~/repo
+
+jobs:
+  playwright-tests:
+    executor: playwright
+    steps:
+      # 1. Checkout code
+      - checkout
+
+      # 2. Restore cached node_modules
+      #    Cache key uses package-lock.json hash so it invalidates on dependency changes
+      - restore_cache:
+          keys:
+            - node-modules-v1-{{ checksum "package-lock.json" }}
+            - node-modules-v1-  # Fallback to most recent cache if hash misses
+
+      # 3. Install dependencies
+      - run:
+          name: Install dependencies
+          command: npm ci
+
+      # 4. Save node_modules to cache
+      - save_cache:
+          key: node-modules-v1-{{ checksum "package-lock.json" }}
+          paths:
+            - node_modules
+
+      # 5. Run Playwright tests
+      #    The official Playwright image already has browsers installed,
+      #    so no need to run `playwright install` — saves ~2 mins of build time
+      - run:
+          name: Run Playwright tests
+          command: npx playwright test --reporter=list,junit
+          # No timeout set here — CircleCI jobs default to 10 min on free tier.
+          # This is usually enough for a focused smoke/regression suite.
+          no_output_timeout: 10m
+
+      # 6. Store test results so CircleCI parses pass/fail per test
+      #    These show up in the CircleCI Test Summary tab
+      - store_test_results:
+          path: test-results
+
+      # 7. Store Playwright HTML report and traces as artifacts
+      #    Accessible from the CircleCI Artifacts tab after the run
+      - store_artifacts:
+          path: playwright-report
+          destination: playwright-report
+
+      # 8. Store any screenshots/videos from failed tests
+      - store_artifacts:
+          path: test-results
+          destination: test-results
+
+# Workflows define when jobs run
+workflows:
+  # Run on every push to main or develop, and on all PRs
+  playwright:
+    jobs:
+      - playwright-tests:
+          filters:
+            branches:
+              only:
+                - main
+                - develop
+                # CircleCI also picks up PR branches automatically
+                # when you connect your GitHub/Bitbucket repo
