@@ -16,7 +16,7 @@ pr:
       - main
 
 pool:
-  vmImage: ubuntu-latest  # Free Microsoft-hosted agent
+  name: Default  # Self-hosted agent
 
 variables:
   NODE_VERSION: '20.x'
