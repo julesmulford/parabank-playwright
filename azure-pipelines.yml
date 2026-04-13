@@ -96,7 +96,7 @@ stages:
             displayName: 'Publish Test Results'
             inputs:
               testResultsFormat: JUnit
-              testResultsFiles: '**/junit.xml'
+              testResultsFiles: **/junit.xml
               failTaskOnFailedTests: true
             condition: always()
 
