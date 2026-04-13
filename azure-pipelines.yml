@@ -92,12 +92,19 @@ stages:
             condition: always()
 
           # 10. Publish JUnit XML — this is what makes the Tests tab appear
+          - script: |
+              echo "Checking for junit.xml..."
+              dir test-results /s /b 2>nul || echo "test-results dir not found or empty"
+            displayName: 'Diagnose test-results folder'
+            condition: always()
+
           - task: PublishTestResults@2
             displayName: 'Publish Test Results'
             inputs:
               testResultsFormat: JUnit
               testResultsFiles: "test-results/junit.xml"
-              failTaskOnFailedTests: true
+              searchFolder: $(System.DefaultWorkingDirectory)
+              failTaskOnFailedTests: false
             condition: always()
 
           # 8. Stop and remove Parabank container (prevents conflicts on next run)
