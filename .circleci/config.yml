@@ -2,7 +2,7 @@
 # CircleCI — Playwright Test Suite (.circleci/config.yml)
 # Free tier safe: 6,000 credits/month on free plan
 # Uses resource_class: medium (5 credits/min) = ~20 mins/run
-# Estimated: 100 credits per run — leaves plenty of headroom
+# Estimated: 100 credits per run
 # ============================================================
 
 version: 2.1

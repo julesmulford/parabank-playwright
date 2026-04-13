@@ -11,7 +11,7 @@ version: 0.2
 env:
   variables:
     NODE_VERSION: "20"
-    BASE_URL: "https://your-app-url.com"  # Replace with your app URL
+    BASE_URL: "http://localhost:3000/parabank/"
   # Store sensitive values in AWS SSM Parameter Store (free)
   # and reference them here rather than hardcoding:
   # parameter-store:
@@ -35,6 +35,12 @@ phases:
     commands:
       - echo "Starting Playwright test run at $(date)"
       - echo "Node version $(node --version)"
+      # Start Parabank container
+      - docker pull parasoft/parabank
+      - docker run -d -p 3000:8080 --name parabank parasoft/parabank
+      # Wait for Parabank to be ready then initialise the DB
+      - npx wait-on http://localhost:3000/parabank/ --timeout 60000
+      - curl -X POST http://localhost:3000/parabank/services/bank/initializeDB
 
   build:
     commands:
