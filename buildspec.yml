@@ -69,7 +69,7 @@ phases:
     commands:
       # Run tests — chromium only to keep within free tier limits
       # Add --reporter=junit so results can be parsed by CodeBuild
-      - npx playwright test --reporter=list,junit
+      - npx playwright test --project=chromium --project=api --reporter=list,junit
     
     # Build does not fail the pipeline immediately on test failure —
     # we handle that in post_build so artifacts still get uploaded
