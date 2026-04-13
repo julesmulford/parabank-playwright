@@ -17,19 +17,13 @@ export default defineConfig({
     forbidOnly: !!process.env.CI,
     retries: process.env.CI ? 2 : 0,
 
-    reporter: process.env.CI
-        ? [
-            ['html', { outputFolder: 'playwright-report' }],
-            ['list'],
-            ['json', { outputFile: 'test-results/results.json' }],
-            ['junit', { outputFile: 'test-results/junit.xml' }],
-            ['allure-playwright', { outputFolder: 'allure-results' }],
-          ]
-        : [
-            ['html', { outputFolder: 'playwright-report' }],
-            ['list'],
-            ['allure-playwright', { outputFolder: 'allure-results' }],
-          ],
+    reporter: [
+        ['html', { outputFolder: 'playwright-report' }],
+        ['list'],
+        ['junit', { outputFile: 'test-results/junit.xml' }],
+        ['allure-playwright', { outputFolder: 'allure-results' }],
+        ...(process.env.CI ? [['json', { outputFile: 'test-results/results.json' }] as const] : []),
+    ],
 
     use: {
         baseURL: process.env.BASE_URL  || "http://localhost:3000/parabank/",
