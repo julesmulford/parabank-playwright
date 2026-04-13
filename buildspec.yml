@@ -26,10 +26,19 @@ phases:
       # Install dependencies
       - npm ci
 
-      # Install Chromium only — keeps install time and disk usage low.
-      # DO NOT run `npx playwright install` without specifying a browser
-      # as it installs all browsers and will bloat build time significantly.
-      - npx playwright install chromium --with-deps
+      # Install Chromium OS dependencies — method depends on the package manager
+      # Ubuntu/Debian (standard:7.0 image) uses apt-get
+      # Amazon Linux uses yum — Playwright's --with-deps only supports apt-get
+      - |
+        if command -v apt-get &> /dev/null; then
+          npx playwright install chromium --with-deps
+        else
+          # Amazon Linux: install known Chromium dependencies via yum then install browser
+          yum install -y atk cups-libs gtk3 libXcomposite libXcursor libXdamage \
+            libXext libXi libXrandr libXScrnSaver libXtst pango alsa-lib \
+            nss mesa-libgbm || true
+          npx playwright install chromium
+        fi
 
   pre_build:
     commands:
@@ -38,8 +47,18 @@ phases:
       # Start Parabank container
       - docker pull parasoft/parabank
       - docker run -d -p 3000:8080 --name parabank parasoft/parabank
-      # Wait for Parabank to be ready then initialise the DB
-      - npx wait-on http://localhost:3000/parabank/ --timeout 60000
+      # Wait for Parabank to be ready (up to 3 mins) then initialise the DB
+      # Using curl instead of wait-on — tolerates redirects and non-2xx during startup
+      - |
+        echo "Waiting for Parabank..."
+        for i in $(seq 1 36); do
+          if curl -sf --max-time 5 http://localhost:3000/parabank/index.htm > /dev/null 2>&1; then
+            echo "Parabank is up after ${i}x5s"
+            break
+          fi
+          echo "  attempt ${i}/36..."
+          sleep 5
+        done
       - curl -X POST http://localhost:3000/parabank/services/bank/initializeDB
 
   build:

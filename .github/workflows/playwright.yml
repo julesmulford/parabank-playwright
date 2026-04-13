@@ -89,6 +89,14 @@ jobs:
             test-results/
           retention-days: 14
 
+      - name: Publish report to GitHub Pages
+        if: always() && github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: playwright-report
+          destination_dir: playwright-report
+
   # ── Job 3: Analyser ──────────────────────────────────────────────────────
   # Reads the test results and posts a plain-English failure summary
   # as a comment on the PR (or prints to the log on a push).
