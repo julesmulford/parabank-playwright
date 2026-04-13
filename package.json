@@ -20,7 +20,14 @@
         "agent:orchestrate:run": "tsx tests/agents/orchestrator.ts --run",
         "agent:heal": "tsx tests/agents/locatorHealer.ts",
         "agent:generate": "tsx tests/agents/testGenerator.ts",
-        "agent:data": "tsx tests/agents/dataFactory.ts"
+        "agent:data": "tsx tests/agents/dataFactory.ts",
+        "agent:coverage": "tsx tests/agents/coverageReporter.ts",
+        "agent:flakiness": "tsx tests/agents/flakinessDetector.ts",
+        "agent:review": "tsx tests/agents/conventionReviewer.ts",
+        "agent:review:staged": "tsx tests/agents/conventionReviewer.ts --staged",
+        "agent:heal:all": "tsx tests/agents/locatorHealer.ts --all",
+        "agent:trace": "tsx tests/agents/traceInspector.ts",
+        "agent:trace:all": "tsx tests/agents/traceInspector.ts --all"
     },
     "devDependencies": {
         "@playwright/test": "^1.59.1",

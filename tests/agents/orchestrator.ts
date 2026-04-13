@@ -5,10 +5,15 @@
  * the minimal set of Playwright tests that need to run.  Outputs a ready-to-run
  * `npx playwright test` command and optionally executes it.
  *
+ * Model: claude-haiku-4-5 — fast and cheap for a pure classification task.
+ * Prompt caching: system prompt is cached so repeated CI runs pay only for
+ * the short changed-file list, not the full instructions every time.
+ *
  * Usage:
- *   npx tsx tests/agents/orchestrator.ts              # diff against HEAD
- *   npx tsx tests/agents/orchestrator.ts --run        # diff and execute
- *   npx tsx tests/agents/orchestrator.ts --base main  # diff against main branch
+ *   npx tsx tests/agents/orchestrator.ts                     # diff against HEAD
+ *   npx tsx tests/agents/orchestrator.ts --run               # diff and execute
+ *   npx tsx tests/agents/orchestrator.ts --base main         # diff against main branch
+ *   npx tsx tests/agents/orchestrator.ts --verbose           # show token usage + reasoning
  */
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -16,89 +21,131 @@ import { execSync, spawn } from 'child_process';
 
 const client = new Anthropic();
 
-// ── helpers ────────────────────────────────────────────────────────────────
+// ── System prompt (cached — never changes between runs) ─────────────────────
 
-function getChangedFiles(base = 'HEAD'): string[] {
+const SYSTEM_PROMPT = `You are a Playwright CI orchestrator for a TypeScript Playwright framework.
+
+Project layout:
+  tests/api/            API specs          → project: api
+  tests/ui/             UI specs           → projects: chromium, firefox, webkit
+  tests/accessibility/  A11y specs         → project: chromium
+  tests/performance/    Performance specs  → project: chromium
+  tests/pages/          Page objects       (not runnable — imported by UI tests)
+  tests/actions/        Multi-step flows   (not runnable — imported by UI tests)
+  tests/data/           Test data          (imported by ALL tests)
+  tests/fixtures/       Playwright fixtures (imported by ALL tests)
+  playwright.config.ts  Global config
+
+Decision rules — apply the FIRST rule that matches and stop:
+1. playwright.config.ts changed                         → npx playwright test
+2. tests/data/ OR tests/fixtures/ changed               → npx playwright test
+3. tests/pages/ OR tests/actions/ changed               → npx playwright test --project=chromium
+4. Only tests/api/ changed                              → npx playwright test --project=api
+5. Only some tests/ui/ specs changed                    → npx playwright test <file1> <file2> --project=chromium
+6. Only tests/accessibility/ changed                    → npx playwright test tests/accessibility/ --project=chromium
+7. Only tests/performance/ changed                      → npx playwright test tests/performance/ --project=chromium
+8. Only CI config / docs / non-test files changed       → no-tests-needed
+
+Output exactly ONE shell command starting with "npx playwright test", or the literal string "no-tests-needed".
+No explanation. No markdown fences. No surrounding quotes.`;
+
+// ── Git helpers ─────────────────────────────────────────────────────────────
+
+function validateRef(ref: string): boolean {
   try {
-    const output = execSync(`git diff --name-only ${base}`, {
+    execSync(`git rev-parse --verify "${ref}"`, {
       encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
-    return output.trim().split('\n').filter(Boolean);
+    return true;
   } catch {
-    // Fallback: all tracked files if git isn't available
+    return false;
+  }
+}
+
+function getChangedFiles(base: string): string[] {
+  try {
+    const out = execSync(`git diff --name-only ${base}`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    return out.trim().split('\n').filter(Boolean);
+  } catch {
     return [];
   }
 }
 
 function getStagedFiles(): string[] {
   try {
-    const output = execSync('git diff --cached --name-only', {
+    const out = execSync('git diff --cached --name-only', {
       encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
-    return output.trim().split('\n').filter(Boolean);
+    return out.trim().split('\n').filter(Boolean);
   } catch {
     return [];
   }
 }
 
-function runCommand(cmd: string): void {
-  console.log(`\nRunning: ${cmd}\n`);
-  const [bin, ...cmdArgs] = cmd.split(' ');
-  const proc = spawn(bin, cmdArgs, { stdio: 'inherit', shell: true });
-  proc.on('close', (code) => {
-    process.exit(code ?? 0);
+// ── Safe command runner ─────────────────────────────────────────────────────
+// Splits on whitespace but respects single- and double-quoted groups so that
+// file paths containing spaces survive intact.
+
+function runPlaywrightCommand(cmd: string): void {
+  console.error(`\nExecuting: ${cmd}\n${'─'.repeat(60)}`);
+  const parts = cmd.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? ['npx', 'playwright', 'test'];
+  const [bin, ...cmdArgs] = parts;
+  const proc = spawn(bin, cmdArgs, {
+    stdio: 'inherit',
+    shell: process.platform === 'win32',
   });
+  proc.on('close', (code) => process.exit(code ?? 0));
 }
 
-// ── main ───────────────────────────────────────────────────────────────────
+// ── Main ────────────────────────────────────────────────────────────────────
 
-async function orchestrate(base: string, shouldRun: boolean) {
-  const changed = [...getChangedFiles(base), ...getStagedFiles()];
-  const unique = [...new Set(changed)];
+async function orchestrate(base: string, shouldRun: boolean, verbose: boolean): Promise<void> {
+  if (base !== 'HEAD' && !validateRef(base)) {
+    console.error(
+      `✗ Git ref "${base}" does not exist.\n` +
+        `  For local diffs use: --base HEAD (default)\n` +
+        `  For CI branch diffs use: --base origin/main`,
+    );
+    process.exit(1);
+  }
 
-  if (unique.length === 0) {
-    console.error('No changed files detected. Running full suite.');
-    console.log('npx playwright test');
-    if (shouldRun) runCommand('npx playwright test');
+  const changed = [...new Set([...getChangedFiles(base), ...getStagedFiles()])];
+
+  if (verbose) {
+    console.error(`\nChanged files (vs ${base}):`);
+    if (changed.length === 0) console.error('  (none detected)');
+    else changed.forEach((f) => console.error(`  + ${f}`));
+  }
+
+  if (changed.length === 0) {
+    const fallback = 'npx playwright test';
+    console.error('⚠  No changed files detected — running full suite as a safety net.');
+    console.log(fallback);
+    if (shouldRun) runPlaywrightCommand(fallback);
     return;
   }
 
-  const prompt = `You are a Playwright CI orchestrator for a TypeScript Playwright framework.
-
-Project structure:
-- tests/api/          API specs (--project=api)
-- tests/ui/           UI specs (--project=chromium or --project=firefox or --project=webkit)
-- tests/accessibility/ A11y specs (--project=chromium)
-- tests/performance/   Performance specs (--project=chromium)
-- tests/pages/         Page objects (not test files — used by UI tests)
-- tests/actions/       Multi-step flows (used by UI tests)
-- tests/data/          Test data factories (used by all tests)
-- tests/fixtures/      Fixtures (used by all tests)
-- playwright.config.ts Config changes affect everything
-
-Changed files:
-${unique.map((f) => `  - ${f}`).join('\n')}
-
-Rules:
-- If playwright.config.ts changed → run ALL tests
-- If tests/data/ or tests/fixtures/ changed → run ALL tests
-- If tests/pages/ changed → run the UI tests that use those pages (and API if relevant)
-- If tests/api/ changed → run only api project
-- If tests/ui/ changed → run only affected spec files
-- If CI config changed (azure-pipelines.yml, buildspec.yml, .circleci/) → no tests needed
-- Minimise what runs to save CI minutes
-
-Respond with ONLY a single shell command starting with "npx playwright test".
-No explanation. No markdown. Just the command.`;
-
-  console.error(`Checking changed files against ${base}...`);
-  unique.forEach((f) => console.error(`  ${f}`));
-  console.error('\nAsking Claude which tests to run...');
-
   const response = await client.messages.create({
-    model: 'claude-opus-4-6',
+    model: 'claude-haiku-4-5-20251001',
     max_tokens: 256,
-    messages: [{ role: 'user', content: prompt }],
+    system: [
+      {
+        type: 'text',
+        text: SYSTEM_PROMPT,
+        cache_control: { type: 'ephemeral' },
+      },
+    ],
+    messages: [
+      {
+        role: 'user',
+        content: `Changed files:\n${changed.map((f) => `- ${f}`).join('\n')}`,
+      },
+    ],
   });
 
   const command =
@@ -106,19 +153,35 @@ No explanation. No markdown. Just the command.`;
       ? response.content[0].text.trim()
       : 'npx playwright test';
 
-  console.error(`Recommended command: ${command}`);
-  console.log(command);  // stdout only — captured by CI
-
-  if (shouldRun) {
-    runCommand(command);
+  if (verbose) {
+    const u = response.usage as unknown as Record<string, number>;
+    console.error(`\nClaude decision: ${command}`);
+    console.error(
+      `Tokens — input: ${u['input_tokens']}, output: ${u['output_tokens']}, ` +
+        `cache_write: ${u['cache_creation_input_tokens'] ?? 0}, cache_read: ${u['cache_read_input_tokens'] ?? 0}`,
+    );
   }
+
+  // stdout only — captured by CI pipeline
+  console.log(command);
+
+  if (command === 'no-tests-needed') {
+    console.error('ℹ  Only non-test files changed — no Playwright tests required.');
+    return;
+  }
+
+  if (shouldRun) runPlaywrightCommand(command);
 }
 
-// ── entry point ────────────────────────────────────────────────────────────
+// ── Entry point ─────────────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
 const baseFlag = args.indexOf('--base');
 const base = baseFlag !== -1 ? args[baseFlag + 1] : 'HEAD';
 const shouldRun = args.includes('--run');
+const verbose = args.includes('--verbose');
 
-orchestrate(base, shouldRun);
+orchestrate(base, shouldRun, verbose).catch((err: Error) => {
+  console.error('Orchestrator error:', err.message);
+  process.exit(1);
+});
