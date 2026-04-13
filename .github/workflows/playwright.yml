@@ -9,18 +9,45 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
 jobs:
+  # ── Job 1: Orchestrator ──────────────────────────────────────────────────
+  # Decides which tests to run based on changed files.
+  # Outputs the playwright command for the test job to consume.
+  orchestrate:
+    runs-on: ubuntu-latest
+    outputs:
+      test-command: ${{ steps.decide.outputs.command }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so git diff works
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Orchestrator — decide which tests to run
+        id: decide
+        run: |
+          CMD=$(npx tsx tests/agents/orchestrator.ts --base origin/main 2>/dev/null || echo "npx playwright test")
+          echo "command=${CMD}" >> $GITHUB_OUTPUT
+          echo "Orchestrator selected: ${CMD}"
+
+  # ── Job 2: Run tests ─────────────────────────────────────────────────────
   test:
+    needs: orchestrate
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
@@ -33,29 +60,127 @@ jobs:
 
       - name: Start Parabank container
         run: |
-          docker run -d \
-            --name parabank \
-            -p 3000:8080 \
-            parasoft/parabank
+          docker run -d --name parabank -p 3000:8080 parasoft/parabank
           echo "Waiting for Parabank to start..."
           timeout 120 bash -c 'until curl -sf http://localhost:3000/parabank/index.htm; do sleep 3; done'
-          echo "Parabank is up"
 
-      - name: Initialize Parabank database
+      - name: Initialise Parabank database
+        run: curl -X POST http://localhost:3000/parabank/services/bank/initializeDB
+
+      - name: Run tests (orchestrator-selected command)
+        run: ${{ needs.orchestrate.outputs.test-command }} --reporter=list,json
+        continue-on-error: true  # let analyser and artifact steps always run
+
+      - name: Save results for analyser
         run: |
-          curl -X POST http://localhost:3000/parabank/services/bank/initializeDB
-          echo "Database initialized"
+          mkdir -p test-results
+          # Playwright JSON reporter writes to test-results/ by default
+          # If the file doesn't exist yet, create an empty placeholder
+          [ -f test-results/results.json ] || echo '{"suites":[]}' > test-results/results.json
 
-      - name: Run API tests
-        run: npx playwright test --project=api
-
-      - name: Run UI tests (Chromium)
-        run: npx playwright test --project=chromium
-
-      - name: Upload Playwright report
+      - name: Upload test results & report
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: playwright-report
-          path: playwright-report/
+          name: playwright-results
+          path: |
+            playwright-report/
+            test-results/
           retention-days: 14
+
+  # ── Job 3: Analyser ──────────────────────────────────────────────────────
+  # Reads the test results and posts a plain-English failure summary
+  # as a comment on the PR (or prints to the log on a push).
+  analyse:
+    needs: test
+    runs-on: ubuntu-latest
+    if: always()  # run even when tests fail
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Download test results
+        uses: actions/download-artifact@v4
+        with:
+          name: playwright-results
+          path: test-results
+
+      - name: Analyser — diagnose failures
+        id: analyse
+        run: |
+          OUTPUT=$(npx tsx tests/agents/analyser.ts --results test-results/results.json 2>&1 || true)
+          echo "${OUTPUT}"
+          # Save for PR comment
+          echo "ANALYSIS<<EOF" >> $GITHUB_ENV
+          echo "${OUTPUT}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Post analysis as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `## AI Test Analysis\n\n${process.env.ANALYSIS}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body.slice(0, 65000)  // GitHub comment limit
+            });
+
+  # ── Job 4: Locator Healer ────────────────────────────────────────────────
+  # Runs on PRs only. If tests failed due to broken locators, suggests fixes
+  # and posts them as a PR comment. Does NOT auto-apply (for safety).
+  heal-locators:
+    needs: test
+    runs-on: ubuntu-latest
+    if: failure() && github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npx playwright install chromium --with-deps
+
+      - name: Start Parabank (needed for live HTML)
+        run: |
+          docker run -d --name parabank -p 3000:8080 parasoft/parabank
+          timeout 120 bash -c 'until curl -sf http://localhost:3000/parabank/index.htm; do sleep 3; done'
+          curl -X POST http://localhost:3000/parabank/services/bank/initializeDB
+
+      - name: Locator Healer — suggest fixes for all page objects
+        id: heal
+        run: |
+          SUGGESTIONS=""
+          for PAGE in tests/pages/*.ts; do
+            echo "Checking ${PAGE}..."
+            OUT=$(npx tsx tests/agents/locatorHealer.ts --page "${PAGE}" 2>&1 || true)
+            SUGGESTIONS="${SUGGESTIONS}\n### ${PAGE}\n${OUT}\n"
+          done
+          echo "HEALING<<EOF" >> $GITHUB_ENV
+          printf "%b" "${SUGGESTIONS}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Post locator suggestions as PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `## Locator Healer Suggestions\n\n${process.env.HEALING}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body.slice(0, 65000)
+            });

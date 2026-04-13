@@ -17,7 +17,9 @@ export default defineConfig({
     forbidOnly: !!process.env.CI,
     retries: process.env.CI ? 2 : 0,
 
-    reporter: [['html', { outputFolder: 'playwright-report' }], ['list']],
+    reporter: process.env.CI
+        ? [['html', { outputFolder: 'playwright-report' }], ['list'], ['json', { outputFile: 'test-results/results.json' }]]
+        : [['html', { outputFolder: 'playwright-report' }], ['list']],
 
     use: {
         baseURL: process.env.BASE_URL  || "http://localhost:3000/parabank/",

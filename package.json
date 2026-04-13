@@ -14,13 +14,20 @@
         "test:webkit": "playwright test --project=webkit",
         "test:staging": "cross-env TEST_ENV=staging playwright test",
         "test:qa": "cross-env TEST_ENV=qa playwright test",
-        "test:production": "cross-env TEST_ENV=production playwright test"
+        "test:production": "cross-env TEST_ENV=production playwright test",
+        "agent:analyse": "tsx tests/agents/analyser.ts",
+        "agent:orchestrate": "tsx tests/agents/orchestrator.ts",
+        "agent:orchestrate:run": "tsx tests/agents/orchestrator.ts --run",
+        "agent:heal": "tsx tests/agents/locatorHealer.ts",
+        "agent:generate": "tsx tests/agents/testGenerator.ts",
+        "agent:data": "tsx tests/agents/dataFactory.ts"
     },
     "devDependencies": {
         "@playwright/test": "^1.59.1",
         "@types/node": "^20",
         "cross-env": "^10.1.0",
         "dotenv": "^16.6.1",
+        "tsx": "^4.21.0",
         "typescript": "^5.9.3",
         "wait-on": "^9.0.5"
     },
@@ -31,6 +38,7 @@
         "test": "tests"
     },
     "dependencies": {
+        "@anthropic-ai/sdk": "^0.88.0",
         "cross-spawn": "^7.0.6",
         "isexe": "^2.0.0",
         "path-key": "^3.1.1",
