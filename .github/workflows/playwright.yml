@@ -34,7 +34,8 @@ jobs:
       - name: Orchestrator — decide which tests to run
         id: decide
         run: |
-          CMD=$(npx tsx tests/agents/orchestrator.ts --base origin/main 2>/dev/null || echo "npx playwright test")
+          # stderr goes to the log, stdout (just the command) is captured
+          CMD=$(npx tsx tests/agents/orchestrator.ts --base origin/main || echo "npx playwright test")
           echo "command=${CMD}" >> $GITHUB_OUTPUT
           echo "Orchestrator selected: ${CMD}"
 

@@ -57,7 +57,8 @@ async function orchestrate(base: string, shouldRun: boolean) {
   const unique = [...new Set(changed)];
 
   if (unique.length === 0) {
-    console.log('No changed files detected. Running full suite.');
+    console.error('No changed files detected. Running full suite.');
+    console.log('npx playwright test');
     if (shouldRun) runCommand('npx playwright test');
     return;
   }
@@ -90,9 +91,9 @@ Rules:
 Respond with ONLY a single shell command starting with "npx playwright test".
 No explanation. No markdown. Just the command.`;
 
-  console.log(`Checking changed files against ${base}...\n`);
-  unique.forEach((f) => console.log(`  ${f}`));
-  console.log('\nAsking Claude which tests to run...\n');
+  console.error(`Checking changed files against ${base}...`);
+  unique.forEach((f) => console.error(`  ${f}`));
+  console.error('\nAsking Claude which tests to run...');
 
   const response = await client.messages.create({
     model: 'claude-opus-4-6',
@@ -105,7 +106,8 @@ No explanation. No markdown. Just the command.`;
       ? response.content[0].text.trim()
       : 'npx playwright test';
 
-  console.log(`Recommended command:\n  ${command}\n`);
+  console.error(`Recommended command: ${command}`);
+  console.log(command);  // stdout only — captured by CI
 
   if (shouldRun) {
     runCommand(command);
