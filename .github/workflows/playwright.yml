@@ -59,6 +59,12 @@ jobs:
       - name: Install Playwright browsers
         run: npx playwright install --with-deps
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Start Parabank container
         run: |
           docker run -d --name parabank -p 3000:8080 parasoft/parabank
@@ -162,6 +168,12 @@ jobs:
 
       - run: npm ci
       - run: npx playwright install chromium --with-deps
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Start Parabank (needed for live HTML)
         run: |

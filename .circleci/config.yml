@@ -49,7 +49,27 @@ jobs:
           paths:
             - node_modules
 
-      # 5. Run Playwright tests
+      # 5. Start Parabank
+      - run:
+          name: Log in to Docker Hub
+          command: echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+      - run:
+          name: Start Parabank container
+          command: |
+            docker run -d -p 3000:8080 --name parabank parasoft/parabank
+            echo "Waiting for Parabank..."
+            for i in $(seq 1 36); do
+              if curl -sf --max-time 5 http://localhost:3000/parabank/index.htm > /dev/null 2>&1; then
+                echo "Parabank is up"
+                break
+              fi
+              echo "  attempt ${i}/36..."
+              sleep 5
+            done
+            curl -X POST http://localhost:3000/parabank/services/bank/initializeDB
+
+      # 6. Run Playwright tests
       #    The official Playwright image already has browsers installed,
       #    so no need to run `playwright install` — saves ~2 mins of build time
       - run:
