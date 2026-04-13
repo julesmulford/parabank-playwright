@@ -68,22 +68,35 @@ stages:
               BASE_URL: $(BASE_URL)
             continueOnError: true  # Ensures artifacts are published even on failure
 
-          # 5. Publish HTML report as pipeline artifact
-          #    Viewable in the Azure DevOps UI under the build summary
+          # 7. Generate Allure HTML report
+          - script: npx allure generate allure-results --clean -o allure-report
+            displayName: 'Generate Allure report'
+            condition: always()
+
+          # 8. Publish Allure report as artifact (browse in Azure UI)
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Allure Report'
+            inputs:
+              targetPath: allure-report
+              artifact: allure-report
+              publishLocation: pipeline
+            condition: always()
+
+          # 9. Publish Playwright HTML report as artifact
           - task: PublishPipelineArtifact@1
             displayName: 'Publish Playwright HTML Report'
             inputs:
               targetPath: playwright-report
               artifact: playwright-report
               publishLocation: pipeline
-            condition: always()  # Always publish so you can see failures
+            condition: always()
 
-          # 7. Publish JUnit XML results so Azure shows pass/fail per test
+          # 10. Publish JUnit XML — this is what makes the Tests tab appear
           - task: PublishTestResults@2
             displayName: 'Publish Test Results'
             inputs:
               testResultsFormat: JUnit
-              testResultsFiles: test-results/**/*.xml
+              testResultsFiles: test-results/junit.xml
               failTaskOnFailedTests: true
             condition: always()
 

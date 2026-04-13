@@ -79,6 +79,7 @@ phases:
   post_build:
     commands:
       - echo "Build completed at $(date)"
+      - npx allure generate allure-results --clean -o allure-report || true
 
 artifacts:
   # Upload Playwright HTML report and test results to S3
@@ -86,6 +87,7 @@ artifacts:
   # Use a free-tier S3 bucket — standard storage is free up to 5GB for 12 months.
   files:
     - playwright-report/**/*
+    - allure-report/**/*
     - test-results/**/*
   name: playwright-results-$(date +%Y-%m-%d)
   discard-paths: no
@@ -95,7 +97,7 @@ reports:
   # This is free within CodeBuild — no extra cost
   playwright-test-reports:
     files:
-      - test-results/**/*.xml
+      - test-results/junit.xml
     file-format: JUNITXML
 
 cache:

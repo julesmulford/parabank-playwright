@@ -18,8 +18,18 @@ export default defineConfig({
     retries: process.env.CI ? 2 : 0,
 
     reporter: process.env.CI
-        ? [['html', { outputFolder: 'playwright-report' }], ['list'], ['json', { outputFile: 'test-results/results.json' }]]
-        : [['html', { outputFolder: 'playwright-report' }], ['list']],
+        ? [
+            ['html', { outputFolder: 'playwright-report' }],
+            ['list'],
+            ['json', { outputFile: 'test-results/results.json' }],
+            ['junit', { outputFile: 'test-results/junit.xml' }],
+            ['allure-playwright', { outputFolder: 'allure-results' }],
+          ]
+        : [
+            ['html', { outputFolder: 'playwright-report' }],
+            ['list'],
+            ['allure-playwright', { outputFolder: 'allure-results' }],
+          ],
 
     use: {
         baseURL: process.env.BASE_URL  || "http://localhost:3000/parabank/",
