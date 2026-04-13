@@ -44,9 +44,13 @@ phases:
     commands:
       - echo "Starting Playwright test run at $(date)"
       - echo "Node version $(node --version)"
+      # Login to Docker Hub to avoid rate limits (free account = 200 pulls/6hrs)
+      - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
       # Start Parabank container
+      - docker info
       - docker pull parasoft/parabank
       - docker run -d -p 3000:8080 --name parabank parasoft/parabank
+      - sleep 5 && docker ps && docker logs parabank
       # Wait for Parabank to be ready (up to 3 mins) then initialise the DB
       # Using curl instead of wait-on — tolerates redirects and non-2xx during startup
       - |
