@@ -15,7 +15,8 @@
  *   npx tsx tests/agents/testGenerator.ts --feature "loan request" --type api
  *   npx tsx tests/agents/testGenerator.ts --feature "registration page" --type accessibility
  *   npx tsx tests/agents/testGenerator.ts --feature "home page load" --type performance
- *   npx tsx tests/agents/testGenerator.ts --feature "login" --write   # confirm then write
+ *   npx tsx tests/agents/testGenerator.ts --feature "login" --write        # confirm then write
+ *   npx tsx tests/agents/testGenerator.ts --feature "login" --write --yes  # skip confirmation (CI/non-TTY)
  */
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -23,6 +24,7 @@ import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
 import readline from 'readline';
+import { streamToStdout } from './lib/streamUtils.js';
 
 const client = new Anthropic();
 
@@ -39,16 +41,27 @@ const client = new Anthropic();
 function loadProjectContext(testType: string): string {
   const sections: string[] = [];
 
-  // Data types and factories are needed by all test types
+  // Data types and factories are needed by all test types.
+  // Cap each at 6 KB — the interfaces and factory signatures are what Claude needs;
+  // implementation details of large factories add tokens without improving generation quality.
+  const DATA_CAP = 6_000;
   const dataFiles = ['tests/data/types.ts', 'tests/data/factories.ts'];
   for (const f of dataFiles) {
     if (fs.existsSync(f)) {
-      sections.push(`### ${f}\n\`\`\`typescript\n${fs.readFileSync(f, 'utf-8')}\n\`\`\``);
+      let src = fs.readFileSync(f, 'utf-8');
+      if (src.length > DATA_CAP) {
+        src = src.slice(0, DATA_CAP) + '\n// ... (truncated)';
+      }
+      sections.push(`### ${f}\n\`\`\`typescript\n${src}\n\`\`\``);
     }
   }
 
   if (testType !== 'api') {
-    // Fixtures wrapper and page objects are only relevant for browser tests
+    // Fixtures wrapper and page objects are only relevant for browser tests.
+    // Page objects are capped at 6 KB each — Claude needs the locator declarations
+    // and method signatures, not the full implementation, to generate a new spec.
+    // This keeps the L2 cache block lean as the project grows.
+    const PAGE_CAP = 6_000;
     if (fs.existsSync('tests/fixtures/fixtures.ts')) {
       sections.push(
         `### tests/fixtures/fixtures.ts\n\`\`\`typescript\n${fs.readFileSync('tests/fixtures/fixtures.ts', 'utf-8')}\n\`\`\``,
@@ -57,7 +70,11 @@ function loadProjectContext(testType: string): string {
     if (fs.existsSync('tests/pages')) {
       for (const f of fs.readdirSync('tests/pages').filter((n) => n.endsWith('.ts'))) {
         const p = path.join('tests', 'pages', f);
-        sections.push(`### ${p}\n\`\`\`typescript\n${fs.readFileSync(p, 'utf-8')}\n\`\`\``);
+        let src = fs.readFileSync(p, 'utf-8');
+        if (src.length > PAGE_CAP) {
+          src = src.slice(0, PAGE_CAP) + '\n// ... (truncated — see full file for implementation details)';
+        }
+        sections.push(`### ${p}\n\`\`\`typescript\n${src}\n\`\`\``);
       }
     }
   }
@@ -83,8 +100,15 @@ function loadProjectContext(testType: string): string {
   }
 
   if (exampleFile) {
+    // Cap example at 4 KB — the model only needs the import pattern, describe/test structure,
+    // and one or two assertions to understand local conventions. Full files waste L2 cache space.
+    const EXAMPLE_CAP = 4_000;
+    let exampleSrc = fs.readFileSync(exampleFile, 'utf-8');
+    if (exampleSrc.length > EXAMPLE_CAP) {
+      exampleSrc = exampleSrc.slice(0, EXAMPLE_CAP) + '\n// ... (truncated)';
+    }
     sections.push(
-      `### ${exampleFile} (example — match this style)\n\`\`\`typescript\n${fs.readFileSync(exampleFile, 'utf-8')}\n\`\`\``,
+      `### ${exampleFile} (example — match this style)\n\`\`\`typescript\n${exampleSrc}\n\`\`\``,
     );
   }
 
@@ -160,12 +184,21 @@ function deriveOutputPath(feature: string, testType: string): string {
     accessibility: 'tests/accessibility',
     performance: 'tests/performance',
   };
-  return path.join(dirMap[testType] ?? 'tests/ui', `${slug}.spec.ts`);
+  // Always use forward slashes — path.join produces backslashes on Windows, but
+  // the regex that parses Claude's "// tests/path/to/file.ts" comment block and
+  // the Playwright test runner both expect forward slashes.
+  return `${dirMap[testType] ?? 'tests/ui'}/${slug}.spec.ts`;
 }
 
 // ── Confirmation prompt ─────────────────────────────────────────────────────
+// In non-TTY environments (CI, piped stdin) readline.question never fires.
+// --yes bypasses the prompt so the generator can be scripted without hanging.
 
-function confirm(question: string): Promise<boolean> {
+function confirm(question: string, autoYes: boolean): Promise<boolean> {
+  if (autoYes || !process.stdin.isTTY) {
+    console.error(`${question} [auto-yes]`);
+    return Promise.resolve(true);
+  }
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
     rl.question(`${question} [y/N] `, (answer) => {
@@ -217,7 +250,7 @@ function isRegisteredInFixtures(className: string): boolean {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
-async function generateTest(feature: string, testType: string, write: boolean): Promise<void> {
+async function generateTest(feature: string, testType: string, write: boolean, autoYes: boolean): Promise<void> {
   const context = loadProjectContext(testType);
   const outputPath = deriveOutputPath(feature, testType);
   const typeInstruction = TYPE_INSTRUCTIONS[testType] ?? TYPE_INSTRUCTIONS['ui'];
@@ -246,12 +279,22 @@ Generate all required files. If a UI/a11y/performance test needs a new page obje
 
   console.error(`Generating ${testType} test: "${feature}"\n`);
 
-  // max_tokens must cover thinking + text output combined.
-  // budget_tokens: 8000 for planning; remaining ~8000 for the generated spec + page object.
+  // Adaptive model selection:
+  //   API tests — pure text generation (request/response patterns, no HTML or locator
+  //   reasoning). Sonnet handles this well at ~20% of Opus cost; thinking adds no value.
+  //   UI / a11y / performance — locator choices, fixture wiring, and page object structure
+  //   all benefit from Opus's extended reasoning about accessibility tree vs DOM tradeoffs.
+  const useOpus = testType !== 'api';
+  const model = useOpus ? 'claude-opus-4-6' : 'claude-sonnet-4-6';
+  // Opus: max_tokens covers thinking + text output combined.
+  //   budget_tokens: 8000 for planning; remaining ~8000 for generated spec + page object.
+  // Sonnet: no thinking block — straightforward code generation task.
+  const maxTokens = useOpus ? 16000 : 8000;
+
   const stream = await client.messages.stream({
-    model: 'claude-opus-4-6',
-    max_tokens: 16000,
-    thinking: { type: 'enabled', budget_tokens: 8000 },
+    model,
+    max_tokens: maxTokens,
+    ...(useOpus ? { thinking: { type: 'enabled', budget_tokens: 8000 } } : {}),
     system: [
       {
         type: 'text',
@@ -277,14 +320,7 @@ Generate all required files. If a UI/a11y/performance test needs a new page obje
     ],
   });
 
-  let fullText = '';
-  for await (const event of stream) {
-    if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-      process.stdout.write(event.delta.text);
-      fullText += event.delta.text;
-    }
-  }
-  console.log('\n');
+  const fullText = await streamToStdout(stream);
 
   if (!write) return;
 
@@ -308,7 +344,7 @@ Generate all required files. If a UI/a11y/performance test needs a new page obje
     console.error(`  ${filePath}${exists}`);
   }
 
-  const ok = await confirm('\nWrite these files?');
+  const ok = await confirm('\nWrite these files?', autoYes);
   if (!ok) {
     console.error('Aborted — no files written.');
     return;
@@ -352,6 +388,7 @@ const typeFlag = args.indexOf('--type');
 const feature = featureFlag !== -1 ? args[featureFlag + 1] : null;
 const testType = typeFlag !== -1 ? args[typeFlag + 1] : 'ui';
 const write = args.includes('--write');
+const autoYes = args.includes('--yes');
 
 const validTypes = ['ui', 'api', 'accessibility', 'performance'];
 
@@ -367,7 +404,7 @@ if (!validTypes.includes(testType)) {
   process.exit(1);
 }
 
-generateTest(feature, testType, write).catch((err: Error) => {
+generateTest(feature, testType, write, autoYes).catch((err: Error) => {
   console.error('Generator error:', err.message);
   process.exit(1);
 });

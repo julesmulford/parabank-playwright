@@ -19,6 +19,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { chromium, type Page } from 'playwright';
 import fs from 'fs';
 import path from 'path';
+import { streamToStdout } from './lib/streamUtils.js';
 
 const client = new Anthropic();
 const BASE_URL = process.env.BASE_URL ?? 'http://localhost:3000/parabank/';
@@ -68,7 +69,10 @@ async function crawlParabank(auth?: { username: string; password: string }): Pro
   const visitedUrls = new Set<string>();
 
   try {
-    const context = await browser.newContext();
+    // Explicit viewport matches the project standard (1280×720) so Parabank's
+    // responsive layout renders identically to what tests see — crawled links
+    // reflect the same navigation structure the specs will interact with.
+    const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
     const page = await context.newPage();
 
     async function recordPage(p: Page, requiresAuth: boolean, navLabel: string): Promise<void> {
@@ -175,10 +179,27 @@ async function reportCoverage(
   auth: { username: string; password: string } | undefined,
   outputPath: string | null,
 ): Promise<void> {
+  if (!auth) {
+    console.error(
+      '⚠  --auth not provided — authenticated pages will be excluded from the coverage report.\n' +
+      '   Re-run with: --auth <username> <password> for complete coverage.\n',
+    );
+  }
+
   console.error('Starting coverage analysis...\n');
 
   const specs = scanSpecFiles();
   const discovered = await crawlParabank(auth);
+
+  if (discovered.length === 0) {
+    console.error(
+      `\n✗ No pages discovered from ${BASE_URL}\n` +
+      '  Parabank may not be running. Start it with:\n' +
+      '    docker run -d -p 3000:8080 parasoft/parabank\n' +
+      `    curl -X POST ${new URL('services/bank/initializeDB', BASE_URL).href}`,
+    );
+    process.exit(1);
+  }
 
   console.error(`\nDiscovered ${discovered.length} page(s), found ${specs.length} spec file(s).\n`);
 
@@ -186,9 +207,21 @@ async function reportCoverage(
   // Claude only needs the path to understand the page identity.
   const stripBase = (url: string) => url.replace(BASE_URL, '/');
 
-  const discoveredSection = discovered
+  // Cap discovered pages sent to Claude — deep crawls of large apps can produce
+  // 50+ URLs (including query-string variants). Priority: auth pages first (higher
+  // coverage risk), then public pages. 40 is enough for complete Parabank coverage.
+  const PAGE_CAP = 40;
+  const prioritised = [
+    ...discovered.filter((p) => p.requiresAuth),
+    ...discovered.filter((p) => !p.requiresAuth),
+  ].slice(0, PAGE_CAP);
+  const truncationNote = discovered.length > PAGE_CAP
+    ? `\n_(${discovered.length - PAGE_CAP} additional page(s) omitted — showing top ${PAGE_CAP} by auth priority)_`
+    : '';
+
+  const discoveredSection = prioritised
     .map((p) => `- [${p.requiresAuth ? 'AUTH' : 'PUBLIC'}] ${p.navLabel} — ${stripBase(p.url)} (title: "${p.title}")`)
-    .join('\n');
+    .join('\n') + truncationNote;
 
   // Limit keywords per spec to 6 — enough for coverage mapping without token bloat
   const specsSection = specs
@@ -217,14 +250,7 @@ async function reportCoverage(
     messages: [{ role: 'user', content: userMessage }],
   });
 
-  let fullText = '';
-  for await (const event of stream) {
-    if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-      process.stdout.write(event.delta.text);
-      fullText += event.delta.text;
-    }
-  }
-  console.log('\n');
+  const fullText = await streamToStdout(stream);
 
   if (outputPath) {
     const header = `# Test Coverage Report — Parabank\n_Generated: ${new Date().toISOString()}_\n\n`;

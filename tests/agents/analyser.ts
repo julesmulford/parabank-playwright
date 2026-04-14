@@ -20,11 +20,13 @@
 import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs';
 import path from 'path';
+import { streamToStdout } from './lib/streamUtils.js';
 
 const client = new Anthropic();
 
 // ── System prompt (cached) ──────────────────────────────────────────────────
 
+// Used for normal --results mode: failure post-mortem
 const SYSTEM_PROMPT = `You are a senior Playwright test automation engineer performing a failure post-mortem.
 
 For each failed test produce a structured entry in this exact format:
@@ -47,7 +49,56 @@ Finish with a **## Summary** section containing:
 
 Be concise and technical. Your audience is a senior QA engineer who reads error traces for a living.`;
 
+// Used exclusively for --compare mode: flakiness between two runs
+// Kept separate because the failure post-mortem categories (Broken locator, Auth failure, etc.)
+// are irrelevant when comparing two result files — the question is WHY a test flips, not
+// what caused a specific error message.
+const COMPARE_SYSTEM_PROMPT = `You are a senior test reliability engineer analysing flakiness between two Playwright result sets.
+
+You will receive a list of tests that changed status between Run A and Run B (passed→failed, failed→passed, or missing).
+
+For each flaky test produce:
+
+### <Test Name>
+**Flip direction**: [pass→fail | fail→pass | appeared | disappeared]
+**Likely cause**: [Race condition | Data state leak | Environment variance | Selector timing | Auth/session expiry | Parallel isolation issue | Test order dependency]
+**Confidence**: [High | Medium | Low]
+**Fix**: One specific, actionable recommendation.
+
+Finish with a **## Flakiness Summary**:
+- Total flaky: N test(s)
+- Most common root cause category
+- Team recommendation: one sentence on the highest-priority fix
+
+Be brief. The audience already understands Playwright internals.`;
+
 // ── Result readers ──────────────────────────────────────────────────────────
+
+/**
+ * Shared recursive walker for Playwright JSON reporter output.
+ * Both parsePlaywrightResultsJson (failure extraction) and extractTestStatuses
+ * (status mapping) use the same nested suite/spec/test structure — extracting
+ * this prevents the two identical recursive traversals from diverging silently.
+ *
+ * @param suite   The suite node (root or child) from the JSON data
+ * @param visitor Called for each (fullTitle, spec, tests[]) triple found
+ * @param prefix  Accumulated parent title for building fully-qualified test names
+ */
+type SuiteVisitor = (
+  title: string,
+  spec: Record<string, unknown>,
+  tests: Record<string, unknown>[],
+) => void;
+
+function walkSuite(suite: Record<string, unknown>, visitor: SuiteVisitor, prefix = ''): void {
+  const title = prefix ? `${prefix} > ${suite['title']}` : String(suite['title'] ?? '');
+  for (const spec of (suite['specs'] as Record<string, unknown>[] | undefined) ?? []) {
+    visitor(title, spec, (spec['tests'] as Record<string, unknown>[] | undefined) ?? []);
+  }
+  for (const child of (suite['suites'] as Record<string, unknown>[] | undefined) ?? []) {
+    walkSuite(child, visitor, title);
+  }
+}
 
 /**
  * Pre-processes Playwright JSON reporter output to extract only the information
@@ -75,42 +126,45 @@ function parsePlaywrightResultsJson(filePath: string): string {
     );
   }
 
+  // Cap failures sent to Claude — large suites can have 100+ failures. Beyond ~20,
+  // Claude sees diminishing returns: it categorises the first failures correctly and
+  // adding more just increases token cost without changing the diagnosis or summary.
+  const FAILURE_CAP = 20;
   const failures: string[] = [];
-  const walk = (suite: Record<string, unknown>, prefix = '') => {
-    const title = prefix ? `${prefix} > ${suite['title']}` : String(suite['title'] ?? '');
-    for (const spec of (suite['specs'] as Record<string, unknown>[] | undefined) ?? []) {
-      const tests = (spec['tests'] as Record<string, unknown>[] | undefined) ?? [];
-      for (const t of tests) {
-        const status = String(t['status'] ?? '');
-        if (status === 'unexpected' || status === 'failed') {
-          const entry: string[] = [`FAIL: ${title} > ${spec['title']}`];
-          const results = (t['results'] as Record<string, unknown>[] | undefined) ?? [];
-          for (const result of results) {
-            const error = result['error'] as Record<string, unknown> | undefined;
-            if (error) {
-              // Both message and stack go into the same entry so they stay together
-              const msg = String(error['message'] ?? '');
-              if (msg) entry.push(`  Error: ${msg.split('\n').slice(0, 5).join('\n         ')}`);
-              const stack = String(error['stack'] ?? '');
-              if (stack) {
-                entry.push(
-                  `  Stack:\n${stack.split('\n').slice(0, 8).map((l) => `    ${l}`).join('\n')}`,
-                );
-              }
+  let totalFailureCount = 0;
+
+  walkSuite(data as Record<string, unknown>, (title, spec, tests) => {
+    for (const t of tests) {
+      const status = String(t['status'] ?? '');
+      if (status === 'unexpected' || status === 'failed') {
+        totalFailureCount++;
+        if (failures.length >= FAILURE_CAP) return; // count but don't append
+        const entry: string[] = [`FAIL: ${title} > ${spec['title']}`];
+        const results = (t['results'] as Record<string, unknown>[] | undefined) ?? [];
+        for (const result of results) {
+          const error = result['error'] as Record<string, unknown> | undefined;
+          if (error) {
+            // Both message and stack go into the same entry so they stay together
+            const msg = String(error['message'] ?? '');
+            if (msg) entry.push(`  Error: ${msg.split('\n').slice(0, 5).join('\n         ')}`);
+            const stack = String(error['stack'] ?? '');
+            if (stack) {
+              entry.push(
+                `  Stack:\n${stack.split('\n').slice(0, 5).map((l) => `    ${l}`).join('\n')}`,
+              );
             }
           }
-          failures.push(...entry, '');
         }
+        failures.push(...entry, '');
       }
     }
-    for (const child of (suite['suites'] as Record<string, unknown>[] | undefined) ?? []) {
-      walk(child, title);
-    }
-  };
-  walk(data as Record<string, unknown>);
+  });
 
   if (failures.length > 0) {
-    lines.push('=== Failures ===', '', ...failures);
+    const truncationNote = totalFailureCount > FAILURE_CAP
+      ? [`(${totalFailureCount - FAILURE_CAP} additional failure(s) omitted — showing first ${FAILURE_CAP})`, '']
+      : [];
+    lines.push('=== Failures ===', '', ...failures, ...truncationNote);
   } else {
     lines.push('=== No failures detected ===');
   }
@@ -118,14 +172,22 @@ function parsePlaywrightResultsJson(filePath: string): string {
   return lines.join('\n');
 }
 
+/**
+ * Extracts a named attribute from a raw XML tag string.
+ * XML attributes have no guaranteed order, so a single ordered regex like
+ * /name="..." tests="..." failures="..."/ silently produces no match when a
+ * JUnit generator writes the attributes in a different sequence.
+ */
+function xmlAttr(tag: string, attr: string): string {
+  const m = tag.match(new RegExp(`\\b${attr}="([^"]*)"`));
+  return m ? m[1] : '';
+}
+
 function parseJunitXml(filePath: string): string {
   const xml = fs.readFileSync(filePath, 'utf-8');
 
-  const suiteMatches = [
-    ...xml.matchAll(
-      /<testsuite[^>]*name="([^"]*)"[^>]*tests="(\d+)"[^>]*failures="(\d+)"[^>]*errors="(\d+)"[^>]*skipped="(\d+)"/g,
-    ),
-  ];
+  // Match the raw opening tag of every <testsuite> element (order-independent).
+  const suiteTagMatches = [...xml.matchAll(/<testsuite\b[^>]*>/g)];
 
   const caseMatches = [
     ...xml.matchAll(/<testcase[^>]*name="([^"]*)"[^>]*classname="([^"]*)"[^>]*>([\s\S]*?)<\/testcase>/g),
@@ -133,7 +195,13 @@ function parseJunitXml(filePath: string): string {
 
   const lines: string[] = ['=== JUnit XML Test Results ===', ''];
 
-  for (const [, name, tests, failures, errors, skipped] of suiteMatches) {
+  for (const [tag] of suiteTagMatches) {
+    const name     = xmlAttr(tag, 'name');
+    const tests    = xmlAttr(tag, 'tests');
+    const failures = xmlAttr(tag, 'failures');
+    const errors   = xmlAttr(tag, 'errors');
+    const skipped  = xmlAttr(tag, 'skipped');
+    if (!name && !tests) continue; // skip empty/malformed tags
     lines.push(`Suite: ${name}`);
     lines.push(`  Total: ${tests} | Failures: ${failures} | Errors: ${errors} | Skipped: ${skipped}`);
     lines.push('');
@@ -149,7 +217,7 @@ function parseJunitXml(filePath: string): string {
       if (msgMatch) lines.push(`  Message: ${msgMatch[1]}`);
       const textMatch = body.match(/<(?:failure|error)[^>]*>([\s\S]*?)<\/(?:failure|error)>/);
       if (textMatch) {
-        const detail = textMatch[1].trim().split('\n').slice(0, 15).join('\n');
+        const detail = textMatch[1].trim().split('\n').slice(0, 8).join('\n');
         lines.push(`  Stack:\n${detail}`);
       }
       lines.push('');
@@ -206,21 +274,12 @@ function collectArtefacts(dir: string): Artefacts {
 function extractTestStatuses(resultsJson: string): Map<string, string> {
   const statuses = new Map<string, string>();
   try {
-    const data = JSON.parse(resultsJson);
-    const walk = (suite: Record<string, unknown>, prefix = '') => {
-      const title = prefix ? `${prefix} > ${suite['title']}` : String(suite['title'] ?? '');
-      for (const spec of (suite['specs'] as Record<string, unknown>[] | undefined) ?? []) {
-        const key = `${title} > ${spec['title']}`;
-        const tests = (spec['tests'] as Record<string, unknown>[] | undefined) ?? [];
-        if (tests.length > 0) {
-          statuses.set(key, String(tests[0]['status'] ?? 'unknown'));
-        }
+    const data = JSON.parse(resultsJson) as Record<string, unknown>;
+    walkSuite(data, (title, spec, tests) => {
+      if (tests.length > 0) {
+        statuses.set(`${title} > ${spec['title']}`, String(tests[0]['status'] ?? 'unknown'));
       }
-      for (const child of (suite['suites'] as Record<string, unknown>[] | undefined) ?? []) {
-        walk(child, title);
-      }
-    };
-    walk(data as Record<string, unknown>);
+    });
   } catch {
     // Malformed JSON — return empty map
   }
@@ -240,6 +299,9 @@ function buildFlakinessReport(pathA: string, pathB: string): string {
     '',
   ];
 
+  // Cap at 30 flaky entries — enough for Claude to identify patterns without sending
+  // hundreds of rows for a badly broken suite where almost every test changed status.
+  const FLAKY_CAP = 30;
   let flakyCount = 0;
   const allKeys = new Set([...statusA.keys(), ...statusB.keys()]);
 
@@ -247,10 +309,16 @@ function buildFlakinessReport(pathA: string, pathB: string): string {
     const a = statusA.get(key) ?? 'missing';
     const b = statusB.get(key) ?? 'missing';
     if (a !== b) {
-      lines.push(`  FLAKY: ${key}`);
-      lines.push(`    Run A: ${a}  →  Run B: ${b}`);
       flakyCount++;
+      if (flakyCount <= FLAKY_CAP) {
+        lines.push(`  FLAKY: ${key}`);
+        lines.push(`    Run A: ${a}  →  Run B: ${b}`);
+      }
     }
+  }
+
+  if (flakyCount > FLAKY_CAP) {
+    lines.push(`  (${flakyCount - FLAKY_CAP} additional flaky test(s) omitted — showing first ${FLAKY_CAP})`);
   }
 
   lines.push('');
@@ -265,8 +333,38 @@ function buildFlakinessReport(pathA: string, pathB: string): string {
 
 // ── Main analyser ───────────────────────────────────────────────────────────
 
-async function analyse(resultsSource: string, outputPath: string | null): Promise<void> {
-  const { errorContexts, screenshotPaths, tracePaths } = collectArtefacts('test-results');
+async function analyse(resultsSource: string, outputPath: string | null, isCompare = false): Promise<void> {
+  // Early exit — zero Claude cost when all tests pass or no diff changes detected.
+  // Covers both normal mode (FAIL:) and --compare mode (FLAKY:), plus JUnit XML.
+  const hasFailures =
+    resultsSource.includes('FAIL:') ||
+    resultsSource.includes('FLAKY:') ||   // --compare mode flakiness report
+    resultsSource.includes('<failure') ||
+    resultsSource.includes('<error');
+
+  if (!hasFailures) {
+    const successMsg = isCompare
+      ? '✅ No status changes between runs — results are consistent.'
+      : '✅ All tests passed — no failures to analyse.';
+    console.log(successMsg);
+    if (outputPath) {
+      const reportTitle = isCompare ? '# Flakiness Comparison Report' : '# Playwright Failure Analysis';
+      fs.writeFileSync(
+        outputPath,
+        `${reportTitle}\n_Generated: ${new Date().toISOString()}_\n\n${successMsg}\n`,
+        'utf-8',
+      );
+      console.error(`✓ Report saved to: ${outputPath}`);
+    }
+    return;
+  }
+
+  // Artefacts (screenshots, traces, error-context files) are only relevant for failure
+  // post-mortems, not for --compare mode which diffs two JSON result files. Skip the
+  // disk scan entirely in compare mode to avoid irrelevant output and unnecessary I/O.
+  const { errorContexts, screenshotPaths, tracePaths } = isCompare
+    ? { errorContexts: '', screenshotPaths: [], tracePaths: [] }
+    : collectArtefacts('test-results');
 
   const artefactNotes: string[] = [];
   if (screenshotPaths.length > 0) {
@@ -280,18 +378,25 @@ async function analyse(resultsSource: string, outputPath: string | null): Promis
     );
   }
 
-  const userContent = [
-    '## Test Results',
-    '```',
-    resultsSource,
-    '```',
-    errorContexts ? `\n## Error Contexts\n${errorContexts}` : '',
-    artefactNotes.length > 0 ? `\n## Captured Artefacts\n${artefactNotes.join('\n')}` : '',
+  // Two-level caching:
+  //   Level 1 — system prompt (analysis rubric, never changes) → always a cache hit
+  //   Level 2 — test results block (stable for the same CI run, changes between runs)
+  //             → cache hit when the agent is re-invoked on the same results file
+  //   Level 3 — artefact notes (trace/screenshot paths, unique per run) → never cached
+  const resultsBlock = `## Test Results\n\`\`\`\n${resultsSource}\n\`\`\``;
+  const artefactsBlock = [
+    errorContexts ? `## Error Contexts\n${errorContexts}` : '',
+    artefactNotes.length > 0 ? `## Captured Artefacts\n${artefactNotes.join('\n')}` : '',
   ]
     .filter(Boolean)
-    .join('\n');
+    .join('\n\n');
 
   console.error('Analysing results with Claude Sonnet...\n');
+
+  // Compare mode uses a dedicated flakiness prompt — the failure post-mortem prompt
+  // asks for categories like "Broken locator | Auth failure" which don't apply when
+  // comparing two run files to find tests that flip status between runs.
+  const activePrompt = isCompare ? COMPARE_SYSTEM_PROMPT : SYSTEM_PROMPT;
 
   const stream = await client.messages.stream({
     model: 'claude-sonnet-4-6',
@@ -299,24 +404,32 @@ async function analyse(resultsSource: string, outputPath: string | null): Promis
     system: [
       {
         type: 'text',
-        text: SYSTEM_PROMPT,
-        cache_control: { type: 'ephemeral' },
+        text: activePrompt,
+        cache_control: { type: 'ephemeral' }, // Level 1
       },
     ],
-    messages: [{ role: 'user', content: userContent }],
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: resultsBlock,
+            cache_control: { type: 'ephemeral' }, // Level 2: stable for same run
+          },
+          ...(artefactsBlock
+            ? [{ type: 'text' as const, text: artefactsBlock }] // Level 3: unique
+            : []),
+        ],
+      },
+    ],
   });
 
-  let fullText = '';
-  for await (const event of stream) {
-    if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-      process.stdout.write(event.delta.text);
-      fullText += event.delta.text;
-    }
-  }
-  console.log('\n');
+  const fullText = await streamToStdout(stream);
 
   if (outputPath) {
-    const header = `# Playwright Failure Analysis\n_Generated: ${new Date().toISOString()}_\n\n`;
+    const reportTitle = isCompare ? '# Flakiness Comparison Report' : '# Playwright Failure Analysis';
+    const header = `${reportTitle}\n_Generated: ${new Date().toISOString()}_\n\n`;
     fs.writeFileSync(outputPath, header + fullText, 'utf-8');
     console.error(`✓ Report saved to: ${outputPath}`);
   }
@@ -337,7 +450,7 @@ if (compareFlag !== -1) {
     console.error('Usage: analyser.ts --compare <run-a.json> <run-b.json>');
     process.exit(1);
   }
-  analyse(buildFlakinessReport(pathA, pathB), outputPath).catch(console.error);
+  analyse(buildFlakinessReport(pathA, pathB), outputPath, true).catch(console.error);
 } else {
   let resultsSource: string | null = null;
 
@@ -352,6 +465,7 @@ if (compareFlag !== -1) {
     const candidates = [
       'test-results/results.json',
       'test-results/junit.xml',
+      '.last-run.json',  // Playwright --last-failed writes here; check after test-results/
     ];
     for (const c of candidates) {
       if (fs.existsSync(c)) {

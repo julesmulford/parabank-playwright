@@ -20,6 +20,7 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs';
+import { streamToStdout } from './lib/streamUtils.js';
 
 const client = new Anthropic();
 
@@ -159,14 +160,7 @@ async function generateData(
     ],
   });
 
-  let fullText = '';
-  for await (const event of stream) {
-    if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-      process.stdout.write(event.delta.text);
-      fullText += event.delta.text;
-    }
-  }
-  console.log('\n');
+  const fullText = await streamToStdout(stream);
 
   if (!write && !outputFile) return;
 

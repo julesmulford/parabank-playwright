@@ -24,6 +24,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { chromium } from 'playwright';
 import fs from 'fs';
 import path from 'path';
+import { streamToStdout } from './lib/streamUtils.js';
 
 const client = new Anthropic();
 
@@ -60,9 +61,13 @@ If no changes are needed, output the original file unchanged inside the block.`;
 // ── URL resolution ──────────────────────────────────────────────────────────
 
 function extractGotoUrl(src: string): string | null {
-  // Match: await this.page.goto('login.htm') or await this.page.goto(`${BASE}register.htm`)
-  const match = src.match(/\.goto\(\s*['"`]([^'"`]+)['"`]/);
-  return match ? match[1] : null;
+  // Match: await this.page.goto('login.htm') or await this.page.goto("register.htm")
+  // Deliberately excludes template literals with interpolation (e.g. `${BASE_URL}login.htm`)
+  // because passing the raw template string to new URL() produces garbage like
+  // "http://localhost:3000/parabank/${BASE_URL}login.htm". Those fall through to
+  // convention-based URL resolution instead.
+  const match = src.match(/\.goto\(\s*(['"])([^'"`${}]+)\1/);
+  return match ? match[2] : null;
 }
 
 function resolveTargetUrl(pageObjectPath: string, src: string): string {
@@ -101,7 +106,9 @@ async function fetchInteractiveHtml(
 ): Promise<{ html: string; ownsBrowser: boolean; browser: import('playwright').Browser }> {
   const ownsBrowser = !sharedBrowser;
   const browser = sharedBrowser ?? await chromium.launch({ headless: true });
-  const context = await browser.newContext();
+  // Explicit viewport matches the project standard (1280×720) so responsive elements
+  // render identically to what developers see — locator suggestions stay consistent.
+  const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
 
   try {
     const page = await context.newPage();
@@ -204,14 +211,28 @@ async function healPageObject(
       ? `## Interactive page elements (forms, inputs, labels, buttons — targeted extraction)\n\`\`\`html\n${html}\n\`\`\``
       : '<!-- Live HTML unavailable — perform static analysis only -->');
 
-  console.error('  Asking Claude Opus to audit locators...\n');
+  // Adaptive model selection:
+  //   Small page objects with no live HTML — straightforward locator mapping with
+  //   clear conventions. Sonnet handles this at ~20% of Opus cost.
+  //   Large page objects OR live HTML present — structural reasoning over accessibility
+  //   tree vs DOM hierarchy is exactly the extended-thinking use-case; use Opus.
+  const locatorCount = (originalSrc.match(/this\.page\./g) ?? []).length;
+  const useOpus = locatorCount >= 8 || html.length > 0;
+  const model = useOpus ? 'claude-opus-4-6' : 'claude-sonnet-4-6';
+  const maxTokens = useOpus ? 16000 : 8000;
 
-  // max_tokens must cover thinking + text output combined.
-  // budget_tokens: 5000 for reasoning; remaining ~7000 for the healed file + diff summary.
+  console.error(
+    `  Asking ${useOpus ? 'Claude Opus (with thinking)' : 'Claude Sonnet'} to audit locators` +
+    ` (${locatorCount} locator(s) found)...\n`,
+  );
+
+  // Opus: max_tokens covers thinking + text output combined.
+  //   budget_tokens: 5000 for reasoning; remaining ~11000 for healed file + diff summary.
+  // Sonnet: no thinking — simple page objects map cleanly to the priority order.
   const stream = await client.messages.stream({
-    model: 'claude-opus-4-6',
-    max_tokens: 12000,
-    thinking: { type: 'enabled', budget_tokens: 5000 },
+    model,
+    max_tokens: maxTokens,
+    ...(useOpus ? { thinking: { type: 'enabled', budget_tokens: 5000 } } : {}),
     system: [
       {
         type: 'text',
@@ -222,14 +243,7 @@ async function healPageObject(
     messages: [{ role: 'user', content: userMessage }],
   });
 
-  let fullText = '';
-  for await (const event of stream) {
-    if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-      process.stdout.write(event.delta.text);
-      fullText += event.delta.text;
-    }
-  }
-  console.log('\n');
+  const fullText = await streamToStdout(stream, '  ');
 
   if (apply) {
     const match = fullText.match(/```typescript\n([\s\S]*?)```/);

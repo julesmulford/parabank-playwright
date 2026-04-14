@@ -25,6 +25,7 @@ import { execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { streamToStdout } from './lib/streamUtils.js';
 
 const client = new Anthropic();
 
@@ -116,7 +117,15 @@ function parseTraceNdjson(ndjson: string): ParsedTrace {
     }
 
     if (event.type === 'before' || event.type === 'after' || event.type === 'action') {
-      if (event.error?.message) errors.push({ time: event.startTime ?? 0, message: event.error.message });
+      // Only collect errors from 'after' events and 'action' events into the errors
+      // array — not 'before' events. 'before'-event errors are shown inline in the
+      // actions log as "❌ ERROR: ...". Recording them here too causes every failed
+      // action to appear twice in the formatted output (inline + Errors section),
+      // doubling the error content sent to Claude.
+      // 'after' events carry the completion error; 'pageError' (below) carries JS exceptions.
+      if (event.type !== 'before' && event.error?.message) {
+        errors.push({ time: event.startTime ?? 0, message: event.error.message });
+      }
       actions.push(event);
     } else if (event.type === 'event') {
       const method = event.method ?? '';
@@ -242,6 +251,12 @@ async function inspectTrace(tracePath: string, outputPath: string | null): Promi
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-trace-'));
 
   let formattedTrace = '';
+  // Trace stats are captured inside the try block and read after it for model selection.
+  // Using separate counters avoids hoisting the full parsed object out of the try scope.
+  let traceActionCount = 0;
+  let traceErrorCount = 0;
+  let traceNetworkCount = 0;
+
   try {
     extractZip(tracePath, tmpDir);
     console.error('  ✓ Extracted trace zip');
@@ -253,11 +268,15 @@ async function inspectTrace(tracePath: string, outputPath: string | null): Promi
       .map((f) => path.join(tmpDir, f));
 
     if (traceJsonFiles.length === 0) {
-      // Check subdirectories (newer Playwright versions use a nested structure)
+      // Check subdirectories (newer Playwright versions use a nested structure).
+      // Skip the 'resources' subdirectory — it contains screenshot/asset blobs as
+      // JSON-named files (e.g. sha256.jpeg), not trace event NDJSON files.
       for (const entry of fs.readdirSync(tmpDir, { withFileTypes: true })) {
-        if (entry.isDirectory()) {
+        if (entry.isDirectory() && entry.name !== 'resources') {
           const sub = path.join(tmpDir, entry.name);
-          for (const f of fs.readdirSync(sub).filter((n) => n.endsWith('.json'))) {
+          for (const f of fs.readdirSync(sub).filter(
+            (n) => n.endsWith('.json') && n !== 'resources',
+          )) {
             traceJsonFiles.push(path.join(sub, f));
           }
         }
@@ -275,8 +294,11 @@ async function inspectTrace(tracePath: string, outputPath: string | null): Promi
 
     const parsed = parseTraceNdjson(combinedNdjson);
     formattedTrace = formatTrace(parsed, tracePath);
+    traceActionCount = parsed.actions.length;
+    traceErrorCount = parsed.errors.length;
+    traceNetworkCount = parsed.networkEvents.length;
     console.error(
-      `  ✓ Parsed ${parsed.actions.length} actions, ${parsed.networkEvents.length} network events, ${parsed.errors.length} error(s)`,
+      `  ✓ Parsed ${traceActionCount} actions, ${traceNetworkCount} network events, ${traceErrorCount} error(s)`,
     );
   } finally {
     try {
@@ -288,14 +310,39 @@ async function inspectTrace(tracePath: string, outputPath: string | null): Promi
 
   if (!formattedTrace) return;
 
-  console.error('  Asking Claude Opus to diagnose the trace...\n');
+  // Hard cap on total formatted trace size. Individual section caps (100 actions,
+  // 50 network, 20 console) still allow each line to be 200–500 chars, so a full
+  // trace can exceed 30 KB. Opus's context window is generous but the signal-to-noise
+  // ratio drops sharply past ~24 KB of trace text. Truncate with a clear marker so
+  // Claude knows the trace continues beyond what it received.
+  const TRACE_CAP = 24_000;
+  if (formattedTrace.length > TRACE_CAP) {
+    formattedTrace = formattedTrace.slice(0, TRACE_CAP) +
+      '\n\n<!-- trace truncated — showing first 24 KB of formatted output -->';
+    console.error('  ⚠ Trace truncated to 24 KB before analysis.');
+  }
 
-  // max_tokens must cover thinking + text output combined.
-  // budget_tokens: 10000 for reasoning; remaining ~6000 for the structured report.
+  // Adaptive model selection — Opus with thinking is only justified for traces that
+  // are genuinely complex to diagnose: many actions (long test), multiple errors
+  // (cascading failures), or significant network activity (timing/auth issues).
+  // Simple traces (small test, single obvious error) are well within Sonnet's reach
+  // at ~20% of the cost, with no thinking overhead.
+  const isComplexTrace =
+    traceActionCount > 40 || traceErrorCount > 2 || traceNetworkCount > 30;
+  const model = isComplexTrace ? 'claude-opus-4-6' : 'claude-sonnet-4-6';
+  const maxTokens = isComplexTrace ? 16000 : 8000;
+
+  console.error(
+    `  Asking ${isComplexTrace ? 'Claude Opus (with thinking)' : 'Claude Sonnet'} to diagnose the trace...\n`,
+  );
+
+  // For Opus: max_tokens covers thinking + text output combined.
+  //   budget_tokens: 10000 for reasoning; remaining ~6000 for the structured report.
+  // For Sonnet: no thinking block — straightforward diagnosis task.
   const stream = await client.messages.stream({
-    model: 'claude-opus-4-6',
-    max_tokens: 16000,
-    thinking: { type: 'enabled', budget_tokens: 10000 },
+    model,
+    max_tokens: maxTokens,
+    ...(isComplexTrace ? { thinking: { type: 'enabled', budget_tokens: 10000 } } : {}),
     system: [
       {
         type: 'text',
@@ -306,14 +353,7 @@ async function inspectTrace(tracePath: string, outputPath: string | null): Promi
     messages: [{ role: 'user', content: formattedTrace }],
   });
 
-  let fullText = '';
-  for await (const event of stream) {
-    if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-      process.stdout.write(event.delta.text);
-      fullText += event.delta.text;
-    }
-  }
-  console.log('\n');
+  const fullText = await streamToStdout(stream, '  ');
 
   if (outputPath) {
     const header =

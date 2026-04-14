@@ -26,12 +26,14 @@
  *   npx tsx tests/agents/conventionReviewer.ts --files tests/ui/login.spec.ts --output review.md
  *   npx tsx tests/agents/conventionReviewer.ts --staged                 # git staged only
  *   npx tsx tests/agents/conventionReviewer.ts --staged --skip-ai       # static analysis only (instant, free)
+ *   npx tsx tests/agents/conventionReviewer.ts --files tests/ui/ --force-ai  # deep AI review even if static is clean
  */
 
 import Anthropic from '@anthropic-ai/sdk';
 import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { streamToStdout } from './lib/streamUtils.js';
 
 const client = new Anthropic();
 
@@ -139,6 +141,40 @@ const STATIC_RULES: Array<{
     fix: 'Use: String(Math.floor(100000000 + Math.random() * 900000000))',
     skipFor: (f) => f.includes('tests/agents/'),
   },
+  {
+    // Spec files must access page objects through the fixture, not via direct import.
+    // Direct imports bypass the fixture lifecycle (beforeEach setup, proper page injection).
+    pattern: /from\s+['"].*\/pages\//,
+    rule: 'Direct page object import in spec — use fixture instead',
+    severity: 'CRITICAL',
+    fix: "Remove the direct import; access the page object via the test fixture parameter (e.g. async ({ loginPage }) => { ... })",
+    skipFor: (f) => !f.endsWith('.spec.ts'),
+  },
+  {
+    // test.only / describe.only left in code ships a partially-run suite to CI.
+    // Every other test is silently skipped — CI appears green but coverage collapses.
+    pattern: /\btest\.only\s*\(|describe\.only\s*\(/,
+    rule: 'test.only / describe.only left in code — skips all other tests in CI',
+    severity: 'CRITICAL',
+    fix: 'Remove .only — use --grep or pass the file path to run focused tests',
+  },
+  {
+    // page.pause() opens the Playwright Inspector and suspends the test indefinitely,
+    // waiting for the user to press Resume. In CI there is no user — the job hangs
+    // until the pipeline timeout kills it, burning CI minutes and blocking the queue.
+    pattern: /\bpage\.pause\s*\(/,
+    rule: 'page.pause() left in code — suspends CI indefinitely (no user to resume)',
+    severity: 'CRITICAL',
+    fix: 'Remove page.pause() — use --debug flag at the CLI level for interactive debugging',
+  },
+  {
+    // page.$eval, page.$$eval, page.$, and page.$$ are all deprecated in Playwright.
+    // They silently continue to work until removed, then break without clear guidance.
+    pattern: /\bpage\.\$\$?eval\s*\(|\bpage\.\$\$?\s*\(/,
+    rule: 'Deprecated Playwright API — page.$eval / page.$$eval / page.$ / page.$$',
+    severity: 'MAJOR',
+    fix: 'Replace with page.locator().evaluate() or locator.evaluateAll()',
+  },
 ];
 
 function staticAnalyse(filePath: string): Violation[] {
@@ -151,13 +187,17 @@ function staticAnalyse(filePath: string): Violation[] {
   for (const rule of STATIC_RULES) {
     if (rule.skipFor?.(filePath)) continue;
     lines.forEach((line, idx) => {
+      // Skip comment lines — a commented-out waitForTimeout or XPath is not a live violation.
+      // Avoids false positives on // TODO: remove page.waitForTimeout() or * @example //-style docs.
+      const trimmed = line.trim();
+      if (trimmed.startsWith('//') || trimmed.startsWith('*')) return;
       if (rule.pattern.test(line)) {
         violations.push({
           file: filePath,
           line: idx + 1,
           rule: rule.rule,
           severity: rule.severity,
-          code: line.trim(),
+          code: trimmed,
           fix: rule.fix,
         });
       }
@@ -191,6 +231,45 @@ function formatStaticViolations(violations: Violation[]): string {
     .join('\n\n');
 }
 
+// ── Context window extractor ──────────────────────────────────────────────────
+
+/**
+ * Extracts only the lines around each violation rather than sending entire file
+ * content to the AI. Reduces token cost by 60–80% on typical spec files while
+ * preserving enough context for Claude to spot subtler issues nearby.
+ *
+ * For files with no static violations (--force-ai path), falls back to the
+ * first 50 lines as a representative structural sample.
+ */
+function extractContextWindows(src: string, violationLines: number[], context = 15): string {
+  const lines = src.split('\n');
+
+  if (violationLines.length === 0) {
+    const sample = lines.slice(0, 50).map((l, i) => `${i + 1}: ${l}`).join('\n');
+    return lines.length > 50
+      ? `${sample}\n// ... (${lines.length - 50} more lines not shown)`
+      : sample;
+  }
+
+  // Build windows and merge overlapping ranges so adjacent violations share context
+  const windows: Array<[number, number]> = violationLines
+    .map((l) => [Math.max(0, l - 1 - context), Math.min(lines.length, l + context)] as [number, number])
+    .sort((a, b) => a[0] - b[0]);
+
+  const merged: Array<[number, number]> = [];
+  for (const [s, e] of windows) {
+    if (merged.length === 0 || merged[merged.length - 1][1] < s) merged.push([s, e]);
+    else merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], e);
+  }
+
+  return merged
+    .map(([s, e]) => {
+      const snippet = lines.slice(s, e).map((l, i) => `${s + i + 1}: ${l}`).join('\n');
+      return `// Lines ${s + 1}–${e}\n${snippet}`;
+    })
+    .join('\n// ...\n');
+}
+
 // ── File resolver ────────────────────────────────────────────────────────────
 
 function resolveFiles(targets: string[]): string[] {
@@ -220,7 +299,7 @@ function resolveFiles(targets: string[]): string[] {
 
 function getStagedTypeScriptFiles(): string[] {
   try {
-    const out = execSync('git diff --cached --name-only --diff-filter=ACM', {
+    const out = execSync('git diff --cached --name-only --diff-filter=ACMR', {
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -239,6 +318,7 @@ async function reviewConventions(
   files: string[],
   outputPath: string | null,
   skipAi: boolean,
+  forceAi: boolean,
 ): Promise<void> {
   if (files.length === 0) {
     console.error('No TypeScript files to review.');
@@ -263,34 +343,65 @@ async function reviewConventions(
   const majorCount = allViolations.filter((v) => v.severity === 'MAJOR').length;
   const minorCount = allViolations.filter((v) => v.severity === 'MINOR').length;
 
-  // Phase 2: AI review — skip when explicitly disabled or when there is no readable file content
+  // Phase 2: AI review — skip when explicitly disabled or when there is no readable file content.
+  // When static analysis is clean, skip AI by default (pass --force-ai to override).
+  // Rationale: sending all files to Haiku on every clean run is expensive with low ROI —
+  // the user can gate a deeper AI review to pre-merge or scheduled checks with --force-ai.
   const readableFiles = files.filter(fs.existsSync);
   let aiText = '';
+
+  const isStaticClean = allViolations.length === 0;
 
   if (skipAi) {
     console.error('Phase 2: AI review skipped (--skip-ai).\n');
   } else if (readableFiles.length === 0) {
     console.error('Phase 2: AI review skipped — no readable files.\n');
+  } else if (isStaticClean && !forceAi) {
+    console.error(
+      'Phase 2: AI review skipped — static analysis is clean.\n' +
+      '  Pass --force-ai for a deep AI review even when no static violations are found.\n',
+    );
   } else {
     console.error('Phase 2: AI review (Claude Haiku)...\n');
 
     // Focus the AI on files that static analysis flagged — those are most likely to have
-    // subtler issues too. If nothing was flagged, send all files so the AI can find what
-    // regex can't catch (poor but technically legal locator choices, missing @smoke tags, etc).
+    // subtler issues too. If nothing was flagged (--force-ai path), send all files
+    // up to the file cap.
     const violationFiles = new Set(allViolations.map((v) => v.file));
-    const filesToReview =
+    const candidates =
       violationFiles.size > 0
         ? readableFiles.filter((f) => violationFiles.has(f))
         : readableFiles;
 
+    // Cap the total number of files sent to Claude — large projects with 50+ spec
+    // files can exceed 400 KB in a single request. Prioritise flagged files (already
+    // selected above); cap the rest at 20. Beyond 20 files, the marginal signal per
+    // additional file is near-zero and token cost is linear.
+    const FILE_LIMIT = 20;
+    const filesToReview = candidates.slice(0, FILE_LIMIT);
+    const omittedCount = candidates.length - filesToReview.length;
+
+    // Send only context windows (30 lines) around each violation rather than full
+    // file content. Reduces token cost by 60–80% vs the old 8 KB-per-file cap
+    // while giving Claude enough context to identify related subtler issues.
     const fileSections = filesToReview
-      .map((f) => `### ${f}\n\`\`\`typescript\n${fs.readFileSync(f, 'utf-8')}\n\`\`\``)
+      .map((f) => {
+        const src = fs.readFileSync(f, 'utf-8');
+        const fileViolationLines = allViolations.filter((v) => v.file === f).map((v) => v.line);
+        const content = extractContextWindows(src, fileViolationLines);
+        return `### ${f}\n\`\`\`typescript\n${content}\n\`\`\``;
+      })
       .join('\n\n');
 
     if (filesToReview.length < readableFiles.length) {
+      const skippedClean = readableFiles.length - candidates.length;
+      const skippedCap = omittedCount;
+      const parts: string[] = [];
+      if (skippedClean > 0) parts.push(`${skippedClean} clean file(s) skipped`);
+      if (skippedCap > 0) parts.push(`${skippedCap} omitted — ${FILE_LIMIT}-file cap reached`);
       console.error(
-        `  Focusing AI review on ${filesToReview.length} flagged file(s) ` +
-          `(${readableFiles.length - filesToReview.length} clean file(s) skipped).\n`,
+        `  Reviewing ${filesToReview.length} file(s)` +
+          (parts.length > 0 ? ` (${parts.join(', ')})` : '') + '.\n',
       );
     }
 
@@ -312,13 +423,7 @@ async function reviewConventions(
     });
 
     console.log('── AI Review ────────────────────────────────────────────────────');
-    for await (const event of stream) {
-      if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-        process.stdout.write(event.delta.text);
-        aiText += event.delta.text;
-      }
-    }
-    console.log('\n');
+    aiText = await streamToStdout(stream);
   }
 
   // Summary
@@ -345,6 +450,12 @@ async function reviewConventions(
     fs.writeFileSync(outputPath, report, 'utf-8');
     console.error(`\n✓ Report saved to: ${outputPath}`);
   }
+
+  // Exit codes for CI / pre-commit hook integration:
+  //   0 — clean (no violations)
+  //   1 — MAJOR violations present (warn but don't block)
+  //   2 — CRITICAL violations present (block the commit / build)
+  process.exitCode = criticalCount > 0 ? 2 : majorCount > 0 ? 1 : 0;
 }
 
 // ── Entry point ──────────────────────────────────────────────────────────────
@@ -354,6 +465,7 @@ const filesFlag = args.indexOf('--files');
 const outputFlag = args.indexOf('--output');
 const useStagedFlag = args.includes('--staged');
 const skipAi = args.includes('--skip-ai');
+const forceAi = args.includes('--force-ai');
 
 const outputPath = outputFlag !== -1 ? args[outputFlag + 1] : null;
 
@@ -375,7 +487,7 @@ if (useStagedFlag) {
   targetFiles = resolveFiles(['tests/ui', 'tests/api', 'tests/pages', 'tests/accessibility', 'tests/performance']);
 }
 
-reviewConventions(targetFiles, outputPath, skipAi).catch((err: Error) => {
+reviewConventions(targetFiles, outputPath, skipAi, forceAi).catch((err: Error) => {
   console.error('Convention reviewer error:', err.message);
   process.exit(1);
 });
