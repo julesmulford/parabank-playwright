@@ -31,50 +31,230 @@ const client = new Anthropic();
 // ── Project context loader ──────────────────────────────────────────────────
 // Globs all existing page objects dynamically so new pages are always included.
 
-/**
- * Loads project context filtered by test type to avoid sending irrelevant tokens.
- * - API tests: types + factories + an API spec example. No page objects (never used in API tests).
- * - UI / a11y / performance: fixtures + types + factories + all page objects + a UI spec example.
- *
- * This can reduce Level-2 cache content by 60-80% for API tests on large codebases.
- */
-function loadProjectContext(testType: string): string {
-  const sections: string[] = [];
+// ── Page-object index cache ─────────────────────────────────────────────────
+// Persists extracted method names and locator labels keyed by file path + mtime.
+// On repeated runs (common during active sessions), this avoids re-reading every
+// page object file just to build the scoring index.
 
-  // Data types and factories are needed by all test types.
-  // Cap each at 6 KB — the interfaces and factory signatures are what Claude needs;
-  // implementation details of large factories add tokens without improving generation quality.
-  const DATA_CAP = 6_000;
+interface IndexEntry {
+  mtime: number;
+  methods: string[];
+  labels: string[];
+}
+
+type PageIndex = Record<string, IndexEntry>;
+
+const PG_INDEX_PATH = '.pg-index.json';
+
+function loadOrBuildPageIndex(pagesDir: string): PageIndex {
+  let cached: PageIndex = {};
+  if (fs.existsSync(PG_INDEX_PATH)) {
+    try {
+      cached = JSON.parse(fs.readFileSync(PG_INDEX_PATH, 'utf-8')) as PageIndex;
+    } catch { /* corrupt index — rebuild silently */ }
+  }
+
+  const files = fs.existsSync(pagesDir)
+    ? fs.readdirSync(pagesDir).filter((n) => n.endsWith('.ts'))
+    : [];
+
+  const updated: PageIndex = {};
+  let changed = false;
+
+  for (const f of files) {
+    const p = path.join(pagesDir, f);
+    const mtime = fs.statSync(p).mtimeMs;
+
+    if (cached[p]?.mtime === mtime) {
+      updated[p] = cached[p]; // cache hit — no file read needed
+    } else {
+      // Cache miss — read first 800 chars for index extraction
+      const preview = fs.readFileSync(p, 'utf-8').slice(0, 800);
+      const methods = [...preview.matchAll(/async\s+(\w+)\s*\(/g)].map(([, m]) => m);
+      const labels = [
+        ...preview.matchAll(/getBy(?:Label|Role|Text|Placeholder)\s*\(\s*['"]([^'"]{1,40})['"]/g),
+      ].map(([, m]) => m);
+      updated[p] = { mtime, methods, labels };
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    try { fs.writeFileSync(PG_INDEX_PATH, JSON.stringify(updated)); } catch { /* best-effort */ }
+  }
+
+  return updated;
+}
+
+// ── Signature extractor for types/factories ─────────────────────────────────
+// Extracts interface/type declarations and function signatures from TypeScript files,
+// stripping function bodies. This gives Claude the type contract without the implementation,
+// reducing factory file sizes by ~60% while preserving all the information needed
+// to generate correct factory calls and type annotations.
+
+function extractTypeSignatures(src: string): string {
+  const lines = src.split('\n');
+  const out: string[] = [];
+  let skipBody = false;
+  let braceDepth = 0;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    // Always include: blank lines, comments, imports, interface/type declarations
+    if (
+      !trimmed ||
+      trimmed.startsWith('//') ||
+      trimmed.startsWith('import ') ||
+      /^(export\s+)?(interface|type)\s+/.test(trimmed)
+    ) {
+      out.push(line);
+      skipBody = false;
+      continue;
+    }
+
+    // Function / const declarations — emit signature, skip body
+    if (/^(export\s+)?(async\s+)?function\s+\w+|^(export\s+)?const\s+\w+\s*=/.test(trimmed)) {
+      if (trimmed.includes('{')) {
+        // Opening brace on same line — emit stub, enter body-skip mode
+        out.push(line.replace(/\{[^}]*$/, '{ /* ... */ }'));
+        braceDepth = (line.match(/\{/g)?.length ?? 0) - (line.match(/\}/g)?.length ?? 0);
+        skipBody = braceDepth > 0;
+      } else {
+        // Multi-line signature (no brace yet) — include
+        out.push(line);
+        skipBody = false;
+      }
+      continue;
+    }
+
+    if (skipBody) {
+      braceDepth += (line.match(/\{/g)?.length ?? 0);
+      braceDepth -= (line.match(/\}/g)?.length ?? 0);
+      if (braceDepth <= 0) {
+        skipBody = false;
+        out.push('}'); // closing brace of the stub
+      }
+      continue; // skip body lines
+    }
+
+    out.push(line);
+  }
+
+  return out.join('\n');
+}
+
+// Common English stop words that add no signal for relevance scoring
+const STOP_WORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'for', 'to', 'of', 'in', 'on', 'at', 'with',
+  'from', 'by', 'as', 'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has',
+  'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might',
+  'can', 'that', 'this', 'its', 'not', 'but', 'into', 'out', 'then', 'than',
+]);
+
+/**
+ * Loads project context filtered by test type AND feature relevance.
+ * Returns the context string and the number of relevant page objects found.
+ *
+ * - API tests: types + factories + example. No page objects.
+ * - UI / a11y / performance: fixtures + types + factories + up to TOP_N most relevant
+ *   page objects + a spec example.
+ *
+ * Two-phase loading: Phase 1 builds a lightweight index from the first 800 chars of each
+ * file (class name, method names, locator labels) — avoids reading full 6 KB files for
+ * objects that won't be selected. Phase 2 reads full content only for the top winners.
+ *
+ * Minimum relevance threshold: if no page object scores > 0, all are omitted entirely
+ * rather than sending 3 random ones that would add noise without improving generation.
+ */
+function loadProjectContext(
+  testType: string,
+  featureText: string,
+): { context: string; relevantPageObjectCount: number } {
+  const sections: string[] = [];
+  let relevantPageObjectCount = 0;
+
+  // Data types and factories — extract signatures only (strip function bodies).
+  // Claude needs interface shapes and function signatures to generate correct factory calls;
+  // it never needs to read factory implementations.
+  const SIG_CAP = 3_000;
   const dataFiles = ['tests/data/types.ts', 'tests/data/factories.ts'];
   for (const f of dataFiles) {
     if (fs.existsSync(f)) {
-      let src = fs.readFileSync(f, 'utf-8');
-      if (src.length > DATA_CAP) {
-        src = src.slice(0, DATA_CAP) + '\n// ... (truncated)';
-      }
-      sections.push(`### ${f}\n\`\`\`typescript\n${src}\n\`\`\``);
+      let src = extractTypeSignatures(fs.readFileSync(f, 'utf-8'));
+      if (src.length > SIG_CAP) src = src.slice(0, SIG_CAP) + '\n// ... (truncated)';
+      sections.push(`### ${f} (signatures only)\n\`\`\`typescript\n${src}\n\`\`\``);
     }
   }
 
   if (testType !== 'api') {
-    // Fixtures wrapper and page objects are only relevant for browser tests.
-    // Page objects are capped at 6 KB each — Claude needs the locator declarations
-    // and method signatures, not the full implementation, to generate a new spec.
-    // This keeps the L2 cache block lean as the project grows.
-    const PAGE_CAP = 6_000;
+    // Fixtures wrapper — capped at 4 KB. Claude needs the import lines and the Fixtures
+    // type to wire new page objects; it doesn't need every existing fixture implementation.
+    const FIXTURES_CAP = 4_000;
     if (fs.existsSync('tests/fixtures/fixtures.ts')) {
-      sections.push(
-        `### tests/fixtures/fixtures.ts\n\`\`\`typescript\n${fs.readFileSync('tests/fixtures/fixtures.ts', 'utf-8')}\n\`\`\``,
-      );
+      let fixtureSrc = fs.readFileSync('tests/fixtures/fixtures.ts', 'utf-8');
+      if (fixtureSrc.length > FIXTURES_CAP) {
+        fixtureSrc = fixtureSrc.slice(0, FIXTURES_CAP) + '\n// ... (truncated)';
+      }
+      sections.push(`### tests/fixtures/fixtures.ts\n\`\`\`typescript\n${fixtureSrc}\n\`\`\``);
     }
+
+    const PAGE_CAP = 6_000;
+    const TOP_N = 3;
+
     if (fs.existsSync('tests/pages')) {
-      for (const f of fs.readdirSync('tests/pages').filter((n) => n.endsWith('.ts'))) {
-        const p = path.join('tests', 'pages', f);
-        let src = fs.readFileSync(p, 'utf-8');
-        if (src.length > PAGE_CAP) {
-          src = src.slice(0, PAGE_CAP) + '\n// ... (truncated — see full file for implementation details)';
+      const keywords = featureText
+        .toLowerCase()
+        .split(/\W+/)
+        .filter((w) => w.length > 3 && !STOP_WORDS.has(w));
+
+      // Use mtime-keyed cache so repeated runs don't re-read every page object.
+      // Cache persists at .pg-index.json in the project root; only rebuilt on file change.
+      const pageIndex = loadOrBuildPageIndex('tests/pages');
+
+      const indexed = Object.entries(pageIndex).map(([p, entry]) => {
+        const f = path.basename(p);
+        const indexText = `${f} ${entry.methods.join(' ')} ${entry.labels.join(' ')}`.toLowerCase();
+        const nameScore = keywords.filter((kw) => f.toLowerCase().includes(kw)).length * 3;
+        const indexScore = keywords.filter((kw) => indexText.includes(kw)).length;
+        return { f, p, score: nameScore + indexScore };
+      });
+
+      // Minimum relevance threshold: if no file scores above 0, skip page objects entirely.
+      // Sending 3 unrelated page objects adds noise that degrades generation quality and
+      // busts the L2 cache unnecessarily.
+      const maxScore = indexed.reduce((m, x) => (x.score > m ? x.score : m), 0);
+      if (maxScore === 0) {
+        sections.push(
+          '<!-- No existing page objects match this feature description — ' +
+          'a new page object will likely be needed -->',
+        );
+        // relevantPageObjectCount stays 0 → caller gates Opus for new-PO generation
+      } else {
+        // Phase 2: read full content only for top-N relevant winners
+        const relevant = indexed.filter((x) => x.score > 0);
+        const top = relevant
+          .sort((a, b) => b.score - a.score || a.f.localeCompare(b.f))
+          .slice(0, TOP_N);
+        relevantPageObjectCount = top.length;
+
+        for (const { p } of top) {
+          let src = fs.readFileSync(p, 'utf-8');
+          if (src.length > PAGE_CAP) {
+            src =
+              src.slice(0, PAGE_CAP) +
+              '\n// ... (truncated — see full file for implementation details)';
+          }
+          sections.push(`### ${p}\n\`\`\`typescript\n${src}\n\`\`\``);
         }
-        sections.push(`### ${p}\n\`\`\`typescript\n${src}\n\`\`\``);
+
+        const omitted = relevant.length - top.length;
+        if (omitted > 0) {
+          sections.push(
+            `<!-- ${omitted} additional matching page object(s) omitted. ` +
+            `Use a more specific --feature description to include them. -->`,
+          );
+        }
       }
     }
   }
@@ -112,7 +292,7 @@ function loadProjectContext(testType: string): string {
     );
   }
 
-  return sections.join('\n\n');
+  return { context: sections.join('\n\n'), relevantPageObjectCount };
 }
 
 // ── Static system prompt (cached — never changes) ──────────────────────────
@@ -251,7 +431,7 @@ function isRegisteredInFixtures(className: string): boolean {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 async function generateTest(feature: string, testType: string, write: boolean, autoYes: boolean): Promise<void> {
-  const context = loadProjectContext(testType);
+  const { context, relevantPageObjectCount } = loadProjectContext(testType, feature);
   const outputPath = deriveOutputPath(feature, testType);
   const typeInstruction = TYPE_INSTRUCTIONS[testType] ?? TYPE_INSTRUCTIONS['ui'];
 
@@ -279,48 +459,82 @@ Generate all required files. If a UI/a11y/performance test needs a new page obje
 
   console.error(`Generating ${testType} test: "${feature}"\n`);
 
-  // Adaptive model selection:
-  //   API tests — pure text generation (request/response patterns, no HTML or locator
-  //   reasoning). Sonnet handles this well at ~20% of Opus cost; thinking adds no value.
-  //   UI / a11y / performance — locator choices, fixture wiring, and page object structure
-  //   all benefit from Opus's extended reasoning about accessibility tree vs DOM tradeoffs.
-  const useOpus = testType !== 'api';
-  const model = useOpus ? 'claude-opus-4-6' : 'claude-sonnet-4-6';
-  // Opus: max_tokens covers thinking + text output combined.
-  //   budget_tokens: 8000 for planning; remaining ~8000 for generated spec + page object.
-  // Sonnet: no thinking block — straightforward code generation task.
-  const maxTokens = useOpus ? 16000 : 8000;
+  // Model selection strategy:
+  //   API tests           → Sonnet (request/response patterns; no locator reasoning)
+  //   1 relevant PO found → Sonnet (extending a single known class; straightforward)
+  //   2+ relevant POs     → Opus+thinking (multi-page flow coordination)
+  //   0 relevant POs      → Sonnet-first with Opus fallback:
+  //                         Try Sonnet first (cheapest); if response contains no file
+  //                         blocks → new page object design is complex → escalate to Opus.
+  //                         This avoids paying Opus cost for simple new-feature specs
+  //                         while still getting Opus quality when it's genuinely needed.
 
-  const stream = await client.messages.stream({
-    model,
-    max_tokens: maxTokens,
-    ...(useOpus ? { thinking: { type: 'enabled', budget_tokens: 8000 } } : {}),
-    system: [
-      {
-        type: 'text',
-        text: STATIC_SYSTEM_PROMPT,  // Level 1: always cached
-        cache_control: { type: 'ephemeral' },
-      },
-    ],
-    messages: [
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: contextBlock,             // Level 2: cached while files are unchanged
-            cache_control: { type: 'ephemeral' },
-          },
-          {
-            type: 'text',
-            text: featureRequest,           // Level 3: small, unique, never cached
-          },
-        ],
-      },
-    ],
-  });
+  const buildMessages = () => [
+    {
+      role: 'user' as const,
+      content: [
+        {
+          type: 'text' as const,
+          text: contextBlock,         // Level 2: cached while files are unchanged
+          cache_control: { type: 'ephemeral' as const },
+        },
+        {
+          type: 'text' as const,
+          text: featureRequest,       // Level 3: small, unique, never cached
+        },
+      ],
+    },
+  ];
 
-  const fullText = await streamToStdout(stream);
+  const systemBlocks = [
+    {
+      type: 'text' as const,
+      text: STATIC_SYSTEM_PROMPT,
+      cache_control: { type: 'ephemeral' as const },
+    },
+  ];
+
+  const useOpusDirect = testType !== 'api' && relevantPageObjectCount >= 2;
+  const useSonnetFirst = testType !== 'api' && relevantPageObjectCount === 0;
+  const useSonnet = testType === 'api' || relevantPageObjectCount === 1;
+
+  let fullText: string;
+
+  if (useSonnet) {
+    const stream = await client.messages.stream({
+      model: 'claude-sonnet-4-6', max_tokens: 8000,
+      system: systemBlocks, messages: buildMessages(),
+    });
+    fullText = await streamToStdout(stream, '', { model: 'sonnet', po_count: relevantPageObjectCount });
+  } else if (useOpusDirect) {
+    const stream = await client.messages.stream({
+      model: 'claude-opus-4-6', max_tokens: 16000,
+      thinking: { type: 'enabled', budget_tokens: 8000 },
+      system: systemBlocks, messages: buildMessages(),
+    });
+    fullText = await streamToStdout(stream, '', { model: 'opus', po_count: relevantPageObjectCount });
+  } else {
+    // Sonnet-first: 0 relevant POs — new feature, try cheap path first
+    const sonnetStream = await client.messages.stream({
+      model: 'claude-sonnet-4-6', max_tokens: 8000,
+      system: systemBlocks, messages: buildMessages(),
+    });
+    fullText = await streamToStdout(sonnetStream, '', { model: 'sonnet-first', po_count: 0 });
+
+    // Check if Sonnet produced parseable file blocks — no blocks = complex new PO design needed
+    const hasBlocks = /\/\/ tests\/[^\n]+\.ts\s*\n```typescript/.test(fullText);
+    if (!hasBlocks) {
+      console.error(
+        '\n⚠  Sonnet response lacked file blocks — escalating to Opus+thinking for new page object design...\n',
+      );
+      const opusStream = await client.messages.stream({
+        model: 'claude-opus-4-6', max_tokens: 16000,
+        thinking: { type: 'enabled', budget_tokens: 8000 },
+        system: systemBlocks, messages: buildMessages(),
+      });
+      fullText = await streamToStdout(opusStream, '', { model: 'opus-escalated', po_count: 0 });
+    }
+  }
 
   if (!write) return;
 

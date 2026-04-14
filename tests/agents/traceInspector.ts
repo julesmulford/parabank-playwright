@@ -167,6 +167,127 @@ function parseTraceNdjson(ndjson: string): ParsedTrace {
   return { actions, networkEvents, consoleMessages, errors, durationMs };
 }
 
+/**
+ * Extracts a compact failure window from the parsed trace.
+ *
+ * Adaptive window sizing:
+ *   - 1 error: ultra-cheap mode — ±3 actions. Single clear failure needs minimal context.
+ *   - 2+ errors: standard mode — ±10 actions. Multiple failures need more surrounding context.
+ *
+ * Also deduplicates and caps error/console-error sections so repeated timeouts or
+ * identical JS exceptions don't multiply the token cost.
+ */
+function reduceToFailureWindow(trace: ParsedTrace, traceFile: string): string {
+  const relevantActions = trace.actions.filter((a) => a.type === 'before' && a.apiName);
+
+  // Adaptive window: single failure → tight 3-action window; multiple → wider 10-action window
+  const windowHalf = trace.errors.length <= 1 ? 3 : 10;
+
+  // Find the index of the first action that errored
+  const firstFailIdx = relevantActions.findIndex((a) => a.error);
+
+  const lines: string[] = [`## Trace file: ${traceFile}`, `Total duration: ${trace.durationMs}ms`, ''];
+
+  if (firstFailIdx === -1 && trace.errors.length === 0) {
+    lines.push(`No failures detected in ${relevantActions.length} actions.`);
+    return lines.join('\n');
+  }
+
+  // Window: ±windowHalf actions around first failure; fall back to last N*2 if no action-level error
+  const windowStart =
+    firstFailIdx === -1
+      ? Math.max(0, relevantActions.length - windowHalf * 2)
+      : Math.max(0, firstFailIdx - windowHalf);
+  const windowEnd =
+    firstFailIdx === -1
+      ? relevantActions.length
+      : Math.min(relevantActions.length, firstFailIdx + windowHalf + 1);
+  const windowActions = relevantActions.slice(windowStart, windowEnd);
+  const failureTime =
+    firstFailIdx !== -1 ? (relevantActions[firstFailIdx].startTime ?? 0) : 0;
+
+  lines.push(
+    `## Actions (${windowActions.length} of ${relevantActions.length} shown — ` +
+    `±${windowHalf} window around first failure)`,
+  );
+  if (windowStart > 0) lines.push(`... (${windowStart} earlier action(s) omitted)`);
+
+  for (const a of windowActions) {
+    const ts = a.startTime ? new Date(a.startTime).toISOString().slice(11, 23) : '??';
+    const paramStr = a.params
+      ? Object.entries(a.params)
+          .slice(0, 3)
+          .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+          .join(', ')
+      : '';
+    const errStr = a.error ? ` ❌ ERROR: ${a.error.message}` : '';
+    lines.push(`[${ts}] ${a.apiName}(${paramStr})${errStr}`);
+  }
+
+  // Network events within ±2 s of the failure timestamp
+  const NETWORK_WINDOW_MS = 2_000;
+  const nearbyNetwork =
+    failureTime > 0
+      ? trace.networkEvents.filter((n) => Math.abs((n.time ?? 0) - failureTime) <= NETWORK_WINDOW_MS)
+      : trace.networkEvents.slice(-10);
+
+  if (nearbyNetwork.length > 0) {
+    lines.push('', `## Network Events (within ±2 s of failure — ${nearbyNetwork.length} event(s))`);
+    for (const n of nearbyNetwork.slice(0, 15)) {
+      const ts = n.time ? new Date(n.time).toISOString().slice(11, 23) : '??';
+      const params = n.params as Record<string, unknown> | undefined;
+      const url = String(params?.['url'] ?? params?.['response'] ?? '');
+      const status = params?.['status'] ? ` [${params['status']}]` : '';
+      const method = params?.['method'] ? ` ${params['method']}` : '';
+      lines.push(`[${ts}] ${n.method}${method}${status} ${url}`);
+    }
+  }
+
+  // Deduplicated errors — repeated timeout messages are a single root cause;
+  // sending 10 identical lines wastes tokens without adding diagnostic signal.
+  const ERROR_CAP = 5;
+  if (trace.errors.length > 0) {
+    lines.push('', '## Errors / Exceptions');
+    const seen = new Set<string>();
+    let printed = 0;
+    for (const e of trace.errors) {
+      const key = e.message.slice(0, 120); // deduplicate by first 120 chars
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const ts = e.time ? new Date(e.time).toISOString().slice(11, 23) : '??';
+      lines.push(`[${ts}] ${e.message}`);
+      if (++printed >= ERROR_CAP) {
+        const remaining = trace.errors.length - printed;
+        if (remaining > 0) lines.push(`... (${remaining} additional error(s) deduplicated)`);
+        break;
+      }
+    }
+  }
+
+  // Console errors only — deduplicated and capped at 5
+  const CONSOLE_ERROR_CAP = 5;
+  const consoleErrors = trace.consoleMessages.filter((m) => m.type === 'error');
+  if (consoleErrors.length > 0) {
+    lines.push('', '## Console Errors');
+    const seen = new Set<string>();
+    let printed = 0;
+    for (const m of consoleErrors) {
+      const key = m.text.slice(0, 120);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const ts = new Date(m.time).toISOString().slice(11, 23);
+      lines.push(`[${ts}] ${m.text}`);
+      if (++printed >= CONSOLE_ERROR_CAP) {
+        const remaining = consoleErrors.length - printed;
+        if (remaining > 0) lines.push(`... (${remaining} additional console error(s) deduplicated)`);
+        break;
+      }
+    }
+  }
+
+  return lines.join('\n');
+}
+
 function formatTrace(trace: ParsedTrace, traceFile: string): string {
   const lines: string[] = [`## Trace file: ${traceFile}`, `Total duration: ${trace.durationMs}ms`, ''];
 
@@ -222,6 +343,100 @@ function formatTrace(trace: ParsedTrace, traceFile: string): string {
   return lines.join('\n');
 }
 
+// ── Deterministic single-error diagnosis ────────────────────────────────────
+
+/**
+ * For single-error traces where the error message matches a known pattern, produce
+ * a local diagnosis without calling Claude. This avoids an API call entirely for
+ * the most common, self-explanatory failures (timeout, locator not found, network error).
+ *
+ * Returns null if the error is ambiguous or multi-cause — caller falls through to Claude.
+ */
+function buildDeterministicDiagnosis(trace: ParsedTrace, traceFile: string): string | null {
+  if (trace.errors.length !== 1) return null;
+
+  const error = trace.errors[0];
+  const failingAction = trace.actions
+    .filter((a) => a.type === 'before' && a.apiName && a.error)
+    .at(0);
+
+  // Only produce local diagnosis for clearly self-explanatory error patterns
+  const DIAGNOSABLE = [
+    { pattern: /timeout.*exceeded|waiting.*timeout/i, category: 'Race condition / selector timing' },
+    { pattern: /locator.*resolved.*to\s+\d+\s+element|strict mode.*resolved/i, category: 'Broken locator — multiple matches' },
+    { pattern: /element.*not.*visible|element.*outside.*viewport/i, category: 'Element state issue' },
+    { pattern: /no elements match|unable to find element/i, category: 'Broken locator — no match' },
+    { pattern: /net::ERR_|navigat.*failed|ERR_CONNECTION/i, category: 'Network failure' },
+    { pattern: /page\.close|target closed/i, category: 'Page closed unexpectedly' },
+  ];
+
+  const matched = DIAGNOSABLE.find(({ pattern }) => pattern.test(error.message));
+  if (!matched) return null; // ambiguous — let Claude reason about it
+
+  const actionLine = failingAction
+    ? `**Action**: \`${failingAction.apiName}\`(${JSON.stringify(failingAction.params ?? {})})`
+    : '';
+
+  // Nearest network failure within ±5s of the error
+  const failureTime = failingAction?.startTime ?? error.time;
+  const networkFail = trace.networkEvents.find((n) => {
+    const params = n.params as Record<string, unknown>;
+    return (
+      ((params?.['status'] as number) ?? 0) >= 400 &&
+      Math.abs((n.time ?? 0) - failureTime) < 5_000
+    );
+  });
+  const networkNote = networkFail
+    ? `**Nearby network failure**: \`${(networkFail.params as Record<string, unknown>)?.['url'] ?? ''}\` [${(networkFail.params as Record<string, unknown>)?.['status']}]`
+    : '';
+
+  const fixes: string[] = (() => {
+    if (/timeout/i.test(error.message)) return [
+      '1. **Immediate**: Replace `page.waitForTimeout()` with `expect(locator).toBeVisible()` or a specific state assertion',
+      '2. **Long-term**: Add an explicit wait tied to application state rather than a fixed time',
+      '3. **Flakiness guard**: Add `test.retries(1)` while investigating',
+    ];
+    if (/locator.*resolved.*to\s+\d+|strict mode/i.test(error.message)) return [
+      '1. **Immediate**: Use `.first()` or `.nth(0)` if the first match is intentional, or make the selector more specific',
+      '2. **Long-term**: Add `data-testid` attributes to disambiguate identical elements',
+    ];
+    if (/no elements match|unable to find/i.test(error.message)) return [
+      '1. **Immediate**: Run the locator healer: `npx tsx tests/agents/locatorHealer.ts --page <PageObject.ts>`',
+      '2. **Long-term**: Prefer `getByRole`/`getByLabel` over fragile id/text selectors',
+      '3. **Verify**: Check whether the element is inside a shadow DOM, iframe, or behind a loading state',
+    ];
+    if (/net::ERR_/i.test(error.message)) return [
+      '1. **Immediate**: Verify the app is running at `BASE_URL` and the DB is initialised',
+      '2. **Long-term**: Add a health-check step in `beforeAll` that fails fast with a clear message',
+    ];
+    return [
+      '1. **Immediate**: Run with `--trace on` and inspect with `npx playwright show-trace`',
+      '2. **Long-term**: Add explicit assertions for intermediate states to narrow the failure point',
+    ];
+  })();
+
+  return [
+    `## Trace file: ${traceFile}`,
+    '',
+    '## Failure Point',
+    actionLine,
+    `**Error**: \`${error.message}\``,
+    ...(networkNote ? [networkNote] : []),
+    '',
+    '## Root Cause Analysis',
+    `**Category**: ${matched.category}`,
+    '**Confidence**: High (pattern-matched deterministically — no Claude call)',
+    `**Evidence**: Error message matches pattern \`${matched.pattern}\``,
+    '',
+    '## Fix Recommendations',
+    ...fixes,
+    '',
+    '_Diagnosis generated locally. Re-run without changes to use Claude for a deeper analysis._',
+  ]
+    .filter((l) => l !== undefined)
+    .join('\n');
+}
+
 // ── Trace file discovery ────────────────────────────────────────────────────
 
 function findTraceFiles(dir: string): string[] {
@@ -251,8 +466,7 @@ async function inspectTrace(tracePath: string, outputPath: string | null): Promi
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-trace-'));
 
   let formattedTrace = '';
-  // Trace stats are captured inside the try block and read after it for model selection.
-  // Using separate counters avoids hoisting the full parsed object out of the try scope.
+  let parsedTrace: ParsedTrace | null = null;
   let traceActionCount = 0;
   let traceErrorCount = 0;
   let traceNetworkCount = 0;
@@ -292,11 +506,11 @@ async function inspectTrace(tracePath: string, outputPath: string | null): Promi
       .map((f) => fs.readFileSync(f, 'utf-8'))
       .join('\n');
 
-    const parsed = parseTraceNdjson(combinedNdjson);
-    formattedTrace = formatTrace(parsed, tracePath);
-    traceActionCount = parsed.actions.length;
-    traceErrorCount = parsed.errors.length;
-    traceNetworkCount = parsed.networkEvents.length;
+    parsedTrace = parseTraceNdjson(combinedNdjson);
+    formattedTrace = formatTrace(parsedTrace, tracePath);
+    traceActionCount = parsedTrace.actions.length;
+    traceErrorCount = parsedTrace.errors.length;
+    traceNetworkCount = parsedTrace.networkEvents.length;
     console.error(
       `  ✓ Parsed ${traceActionCount} actions, ${traceNetworkCount} network events, ${traceErrorCount} error(s)`,
     );
@@ -310,39 +524,75 @@ async function inspectTrace(tracePath: string, outputPath: string | null): Promi
 
   if (!formattedTrace) return;
 
-  // Hard cap on total formatted trace size. Individual section caps (100 actions,
-  // 50 network, 20 console) still allow each line to be 200–500 chars, so a full
-  // trace can exceed 30 KB. Opus's context window is generous but the signal-to-noise
-  // ratio drops sharply past ~24 KB of trace text. Truncate with a clear marker so
-  // Claude knows the trace continues beyond what it received.
-  const TRACE_CAP = 24_000;
-  if (formattedTrace.length > TRACE_CAP) {
-    formattedTrace = formattedTrace.slice(0, TRACE_CAP) +
-      '\n\n<!-- trace truncated — showing first 24 KB of formatted output -->';
-    console.error('  ⚠ Trace truncated to 24 KB before analysis.');
+  // Stage 0: deterministic single-error diagnosis — skip Claude entirely for clear,
+  // pattern-matched failures (timeout, locator not found, network error). This is the
+  // most common case and requires no LLM reasoning.
+  if (parsedTrace && traceErrorCount === 1) {
+    const localDiagnosis = buildDeterministicDiagnosis(parsedTrace, tracePath);
+    if (localDiagnosis) {
+      console.error('  ✓ Single clear error detected — generating deterministic diagnosis (no Claude call)\n');
+      process.stdout.write(localDiagnosis + '\n\n');
+      if (outputPath) {
+        const header = `# Trace Analysis Report\n_Trace: ${tracePath} | Generated: ${new Date().toISOString()} | Mode: deterministic_\n\n`;
+        fs.writeFileSync(outputPath, header + localDiagnosis, 'utf-8');
+        console.error(`  ✓ Report saved to: ${outputPath}`);
+      }
+      return;
+    }
   }
 
-  // Adaptive model selection — Opus with thinking is only justified for traces that
-  // are genuinely complex to diagnose: many actions (long test), multiple errors
-  // (cascading failures), or significant network activity (timing/auth issues).
-  // Simple traces (small test, single obvious error) are well within Sonnet's reach
-  // at ~20% of the cost, with no thinking overhead.
+  // Stage 1 (default): compact failure window → Sonnet. ~70% input token reduction.
+  // Stage 2 (complex): ≥3 DISTINCT errors AND ≥2 distinct failing actions AND >40 actions
+  //   → full trace → Opus+thinking. Requiring distinct signals prevents repeated identical
+  //   timeouts (which are a single root cause) from triggering the expensive Opus path.
+  const TRACE_CAP = 24_000;
+
+  const distinctErrorSigs = new Set(
+    (parsedTrace?.errors ?? []).map((e) => e.message.slice(0, 80)),
+  );
+  const distinctFailingActions = new Set(
+    (parsedTrace?.actions ?? [])
+      .filter((a) => a.error && a.apiName)
+      .map((a) => a.apiName!),
+  );
+
   const isComplexTrace =
-    traceActionCount > 40 || traceErrorCount > 2 || traceNetworkCount > 30;
+    traceErrorCount >= 3 &&
+    traceActionCount > 40 &&
+    distinctErrorSigs.size >= 2 &&
+    distinctFailingActions.size >= 2;
+
+  let analysisInput: string;
+  if (isComplexTrace) {
+    // Full trace for Opus — cap at 24 KB
+    if (formattedTrace.length > TRACE_CAP) {
+      formattedTrace =
+        formattedTrace.slice(0, TRACE_CAP) +
+        '\n\n<!-- trace truncated — showing first 24 KB of formatted output -->';
+      console.error('  ⚠ Trace truncated to 24 KB before analysis.');
+    }
+    analysisInput = formattedTrace;
+  } else {
+    // Compact failure window for Sonnet
+    analysisInput = parsedTrace
+      ? reduceToFailureWindow(parsedTrace, tracePath)
+      : formattedTrace;
+  }
+
   const model = isComplexTrace ? 'claude-opus-4-6' : 'claude-sonnet-4-6';
   const maxTokens = isComplexTrace ? 16000 : 8000;
 
   console.error(
-    `  Asking ${isComplexTrace ? 'Claude Opus (with thinking)' : 'Claude Sonnet'} to diagnose the trace...\n`,
+    `  Asking ${isComplexTrace ? 'Claude Opus (with thinking, full trace)' : 'Claude Sonnet (failure window)'} to diagnose...\n`,
   );
 
-  // For Opus: max_tokens covers thinking + text output combined.
-  //   budget_tokens: 10000 for reasoning; remaining ~6000 for the structured report.
-  // For Sonnet: no thinking block — straightforward diagnosis task.
+  // Opus: max_tokens covers thinking + text output combined.
+  //   budget_tokens: 8000 for reasoning; remaining ~8000 for the structured report.
+  // Sonnet: no thinking — compact failure window provides enough signal.
   const stream = await client.messages.stream({
     model,
     max_tokens: maxTokens,
-    ...(isComplexTrace ? { thinking: { type: 'enabled', budget_tokens: 10000 } } : {}),
+    ...(isComplexTrace ? { thinking: { type: 'enabled', budget_tokens: 8000 } } : {}),
     system: [
       {
         type: 'text',
@@ -350,10 +600,15 @@ async function inspectTrace(tracePath: string, outputPath: string | null): Promi
         cache_control: { type: 'ephemeral' },
       },
     ],
-    messages: [{ role: 'user', content: formattedTrace }],
+    messages: [{ role: 'user', content: analysisInput }],
   });
 
-  const fullText = await streamToStdout(stream, '  ');
+  const fullText = await streamToStdout(stream, '  ', {
+    mode: isComplexTrace ? 'full-trace' : 'failure-window',
+    errors: traceErrorCount,
+    actions: traceActionCount,
+    distinct_errors: distinctErrorSigs.size,
+  });
 
   if (outputPath) {
     const header =

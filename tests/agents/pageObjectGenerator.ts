@@ -48,7 +48,7 @@ CLASS STRUCTURE:
 - Export the class
 - Export a typed data interface alongside the class if the page accepts form input (e.g. interface TransferData { fromAccount: string; toAccount: string; amount: string })
 - Constructor: constructor(private readonly page: Page)
-- All locators declared as readonly properties initialised in the constructor body
+- All locators declared as readonly Locator properties initialised in the constructor body
 
 LOCATOR PRIORITY (highest to lowest resilience — use the highest applicable):
 1. this.page.getByRole('button', { name: 'Submit' })   — most resilient
@@ -63,15 +63,111 @@ STRICT RULES:
 - NEVER put assertions (expect) inside page object methods
 - NEVER use page.waitForTimeout() — use Playwright's built-in action auto-wait
 - Methods are actions only: async fillForm(data: MyData), async submit(), async clickForgotPassword()
-- Add a goto() method: async goto() { await this.page.goto('<url>'); }
+- Add a goto() method: async goto() { await this.page.goto('<relative-url>'); }
 
 OUTPUT FORMAT:
-// tests/pages/<ClassName>.ts
-\`\`\`typescript
-<complete file content>
+Return ONLY a JSON block. The tool assembles the TypeScript file locally — DO NOT include goto(),
+imports, class shell, constructor, or fixture notes (all generated automatically).
+
+\`\`\`json
+{
+  "className": "ExamplePage",
+  "dataInterface": "export interface ExampleData { field: string; }",
+  "locators": [
+    { "name": "submitButton", "selector": "this.page.getByRole('button', { name: 'Submit' })" },
+    { "name": "usernameInput", "selector": "this.page.getByLabel('Username')" }
+  ],
+  "methods": [
+    {
+      "name": "submit",
+      "params": "",
+      "steps": ["submitButton.click()"]
+    },
+    {
+      "name": "fillForm",
+      "params": "data: ExampleData",
+      "steps": ["usernameInput.fill(data.field)"]
+    }
+  ]
+}
 \`\`\`
 
-Then a short note listing which fixtures.ts entry to add.`;
+Rules for the JSON:
+- "dataInterface": full "export interface" string, or null if no form input
+- "locators[].selector": right-hand side ONLY — no "this.xxx =" prefix
+- "methods": each step is the action WITHOUT "await this." — the assembler adds both
+  (e.g. "usernameInput.fill(data.username)" → assembled as "await this.usernameInput.fill(data.username);")
+- goto() is generated automatically — do NOT include it in methods
+- Choose className from the page title when it implies a clearer name than the URL slug
+- No text outside the JSON block`;
+
+// ── Local TypeScript assembler ─────────────────────────────────────────────────
+// Renders the JSON sections from Claude into a complete page object file.
+// Doing this locally avoids Claude re-emitting the entire boilerplate (imports,
+// class shell, constructor template) — saving ~30-50 output tokens per locator.
+
+interface LocatorDef {
+  name: string;
+  selector: string;
+}
+
+// Mini-AST for methods — Claude outputs semantic steps; the assembler renders TypeScript.
+// This eliminates "async", "await", "this.", braces, and "Promise<void>" from Claude's output,
+// saving ~10-15 tokens per step and ~40-60 tokens per method on a typical 3-step method.
+interface MethodDef {
+  name: string;
+  params: string;
+  steps: string[]; // each step WITHOUT "await this." — assembler adds both
+}
+
+interface PageObjectResult {
+  className: string;
+  dataInterface: string | null;
+  locators: LocatorDef[];
+  methods: MethodDef[];
+}
+
+function assemblePageObjectFile(result: PageObjectResult, targetUrl: string): string {
+  const lines: string[] = ["import { Locator, Page } from '@playwright/test';", ''];
+
+  if (result.dataInterface) {
+    lines.push(result.dataInterface, '');
+  }
+
+  lines.push(`export class ${result.className} {`);
+
+  for (const loc of result.locators) {
+    lines.push(`  readonly ${loc.name}: Locator;`);
+  }
+
+  lines.push('', `  constructor(private readonly page: Page) {`);
+  for (const loc of result.locators) {
+    lines.push(`    this.${loc.name} = ${loc.selector};`);
+  }
+  lines.push('  }');
+
+  // goto() is always generated locally from the target URL — not delegated to Claude
+  const gotoUrl = new URL(targetUrl).pathname.replace(/^\/parabank\//, '');
+  lines.push('', `  async goto(): Promise<void> {`);
+  lines.push(`    await this.page.goto('${gotoUrl}');`);
+  lines.push('  }');
+
+  // Render mini-AST methods: each step gets "await this." prefix and ";" suffix
+  for (const method of result.methods) {
+    const body = method.steps
+      .map((step) => `    await this.${step};`)
+      .join('\n');
+    lines.push(
+      '',
+      `  async ${method.name}(${method.params}): Promise<void> {`,
+      body,
+      '  }',
+    );
+  }
+
+  lines.push('}', '');
+  return lines.join('\n');
+}
 
 // ── Class name derivation ─────────────────────────────────────────────────────
 
@@ -213,61 +309,86 @@ async function generatePageObject(
     console.warn('Continuing with URL-only generation (no live HTML).\n');
   }
 
-  // Pass the page title so Claude can choose a semantically correct class name.
-  // "ParaBank - Open New Account" → OpenAccountPage, not the URL-derived "OpenaccountPage".
-  const userMessage =
-    `## Target URL\n${url}\n\n` +
-    `## Page title (prefer this for naming over the URL slug)\n${pageTitle || '(not available)'}\n\n` +
-    `## Suggested class name (override if title implies a better name)\n${className}\n\n` +
-    (html
-      ? `## Interactive elements extracted from live page\n\`\`\`html\n${html}\n\`\`\``
-      : `<!-- Live HTML unavailable — generate based on URL and class name conventions only -->`);
+  // Build user message — skip sections that have no content to avoid "not available" noise.
+  const msgParts: string[] = [`## Target URL\n${url}`];
+  // Include page title only when we actually have one — Claude picks better class names
+  // from real titles ("ParaBank - Open New Account" → OpenAccountPage) than from the slug.
+  if (pageTitle) {
+    msgParts.push(`## Page title (prefer for naming over URL slug)\n${pageTitle}`);
+  }
+  msgParts.push(`## Suggested class name\n${className}`);
+  if (html) {
+    msgParts.push(`## Interactive elements from live page\n\`\`\`html\n${html}\n\`\`\``);
+  }
+  const userMessage = msgParts.join('\n\n');
 
-  // budget_tokens: 6000 for planning locator choices; remaining ~10000 for the generated class
+  // Adaptive model selection:
+  //   Simple pages (≤8 interactive elements, HTML available): Sonnet — locator choices
+  //   are straightforward when the HTML is clear and the page has few fields.
+  //   Complex pages (>8 elements OR no HTML): Opus with thinking — needs to reason
+  //   about accessibility tree structure when many elements compete, or infer structure
+  //   from URL/title alone without live HTML.
+  const elementCount = html ? (html.match(/^</gm) ?? []).length : 0;
+  const useOpus = elementCount > 8 || !html;
+  const model = useOpus ? 'claude-opus-4-6' : 'claude-sonnet-4-6';
+  const maxTokens = useOpus ? 16000 : 8000;
+
+  console.error(
+    `  Using ${useOpus ? 'Claude Opus (with thinking)' : 'Claude Sonnet'} ` +
+    `(${elementCount} interactive element(s) found)\n`,
+  );
+
+  // Opus: budget_tokens 5000 for locator reasoning; remaining ~11000 for JSON output.
+  // Sonnet: no thinking — simple forms map cleanly to the locator priority order.
   const stream = await client.messages.stream({
-    model: 'claude-opus-4-6',
-    max_tokens: 16000,
-    thinking: { type: 'enabled', budget_tokens: 6000 },
+    model,
+    max_tokens: maxTokens,
+    ...(useOpus ? { thinking: { type: 'enabled', budget_tokens: 5000 } } : {}),
     system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
     messages: [{ role: 'user', content: userMessage }],
   });
 
-  const fullText = await streamToStdout(stream);
+  const fullText = await streamToStdout(stream, '', {
+    model: useOpus ? 'opus' : 'sonnet',
+    elements: elementCount,
+    html_available: html.length > 0,
+  });
 
   if (!write) return;
 
-  // Extract the typescript block
-  const match = fullText.match(/\/\/ (tests\/pages\/[^\n]+\.ts)\s*\n```typescript\n([\s\S]*?)```/);
-  if (!match) {
-    // Fallback: extract any typescript block
-    const fallback = fullText.match(/```typescript\n([\s\S]*?)```/);
-    if (!fallback) {
-      console.error('⚠  Could not parse a typescript block from the response. Review the output above.');
-      return;
-    }
-    const outputPath = `tests/pages/${className}.ts`;
-    const exists = fs.existsSync(outputPath) ? ' ⚠ OVERWRITES EXISTING' : ' (new)';
-    console.error(`\nFile to write: ${outputPath}${exists}`);
-    const ok = await confirm('Write this file?');
-    if (!ok) { console.error('Aborted — nothing written.'); return; }
-    fs.mkdirSync('tests/pages', { recursive: true });
-    fs.writeFileSync(outputPath, fallback[1], 'utf-8');
-    console.error(`✓ Written: ${outputPath}`);
-    reportPostWrite(outputPath, className);
+  // Parse the JSON sections block and assemble the TypeScript file locally.
+  // This avoids Claude re-emitting all the boilerplate (imports, class shell, constructor).
+  const jsonMatch = fullText.match(/```json\n([\s\S]*?)```/);
+  if (!jsonMatch) {
+    console.error('⚠  Could not find JSON block in response. Review the output above.');
     return;
   }
 
-  const [, filePath, content] = match;
+  let result: PageObjectResult;
+  try {
+    result = JSON.parse(jsonMatch[1]) as PageObjectResult;
+  } catch {
+    console.error('⚠  Could not parse JSON block — review the output above.');
+    return;
+  }
+
+  if (!result.className || !Array.isArray(result.locators) || !Array.isArray(result.methods)) {
+    console.error('⚠  JSON block is missing required fields (className, locators, methods).');
+    return;
+  }
+
+  const fileContent = assemblePageObjectFile(result, url);
+  const filePath = `tests/pages/${result.className}.ts`;
   const exists = fs.existsSync(filePath) ? ' ⚠ OVERWRITES EXISTING' : ' (new)';
   console.error(`\nFile to write: ${filePath}${exists}`);
 
   const ok = await confirm('Write this file?');
   if (!ok) { console.error('Aborted — nothing written.'); return; }
 
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, content, 'utf-8');
+  fs.mkdirSync('tests/pages', { recursive: true });
+  fs.writeFileSync(filePath, fileContent, 'utf-8');
   console.error(`✓ Written: ${filePath}`);
-  reportPostWrite(filePath, className);
+  reportPostWrite(filePath, result.className);
 }
 
 function reportPostWrite(filePath: string, className: string): void {
@@ -283,9 +404,11 @@ function reportPostWrite(filePath: string, className: string): void {
   }
 
   if (!isRegisteredInFixtures(className)) {
-    console.error(`\n⚠  Register ${className} in tests/fixtures/fixtures.ts before running UI tests:`);
+    // Generate the fixture entry locally — no need for Claude to emit it.
+    const fixtureName = className.charAt(0).toLowerCase() + className.slice(1);
+    console.error(`\n⚠  Register ${className} in tests/fixtures/fixtures.ts:`);
     console.error(`   import { ${className} } from '../pages/${className}';`);
-    console.error(`   ${className.charAt(0).toLowerCase() + className.slice(1)}: async ({ page }, use) => { await use(new ${className}(page)); },`);
+    console.error(`   ${fixtureName}: async ({ page }, use) => { await use(new ${className}(page)); },`);
   }
 }
 

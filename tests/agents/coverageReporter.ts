@@ -26,29 +26,27 @@ const BASE_URL = process.env.BASE_URL ?? 'http://localhost:3000/parabank/';
 
 // ── System prompt (cached) ──────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are a senior QA architect analysing test coverage for Parabank, a Java web banking application.
+const SYSTEM_PROMPT = `You are a senior QA architect advising on Playwright test coverage gaps for Parabank, a Java web banking application.
 
-Given:
-1. A list of discovered pages/features from crawling the live app
-2. A summary of existing Playwright spec files and what they cover
+The coverage mapping has already been computed locally. You will receive:
+1. Pages/features already confirmed as NOT covered or only partially covered (the local matcher found no spec keyword overlap)
+2. Their best-matching spec files (if any partial overlap was found)
+
+Your job is prioritisation and recommendations only — do NOT re-derive coverage from scratch.
 
 Produce a coverage report in this format:
 
 ## Coverage Summary
-Overall coverage: X / Y pages tested (Z%)
-
-## ✅ Well Covered
-List pages/features with solid test coverage.
+(Totals will be pre-filled — add a one-sentence health assessment)
 
 ## ⚠️ Partially Covered
-List pages/features with some tests but missing important scenarios (happy path only, no error states, etc.).
-For each: describe the specific gaps.
+For each partially-covered page: name the specific missing scenarios (error states, auth edge cases, negative paths).
 
 ## 🔴 Not Covered — Priority Order
-List untested pages/features ranked by risk. For each entry:
+Rank uncovered pages by business/technical risk. For each:
 **<Page/Feature Name>**
 Risk: [Critical | High | Medium | Low]
-Why: <one sentence on the business/technical risk of this gap>
+Why: <one sentence on the business/technical risk>
 Suggest: <one concrete test scenario to write first>
 
 ## Recommended Next Sprint
@@ -173,6 +171,111 @@ function scanSpecFiles(): SpecSummary[] {
   return summaries;
 }
 
+// ── Local coverage mapper ─────────────────────────────────────────────────────
+
+type CoverageLevel = 'well-covered' | 'partial' | 'uncovered';
+
+interface CoverageMapping {
+  page: DiscoveredPage;
+  matchedSpecs: Array<{ filePath: string; testCount: number; matchScore: number }>;
+  coverageLevel: CoverageLevel;
+  normalizedScore: number;
+}
+
+// Generic banking words that appear on every Parabank page — including them would match
+// almost every spec and produce false "well-covered" classifications.
+const COVERAGE_BLACKLIST = new Set([
+  'page', 'bank', 'para', 'parabank', 'account', 'overview', 'index', 'home',
+  'user', 'customer', 'from', 'list', 'view', 'welcome', 'services', 'about',
+  'contact', 'news', 'read', 'more', 'back', 'next', 'submit', 'cancel',
+]);
+
+// Synonym normalization — maps aliases to canonical terms so "signin" matches a spec
+// titled "login" and "signup" matches "register".
+const SYNONYMS: Record<string, string> = {
+  signin: 'login', 'sign-in': 'login', signout: 'logout',
+  signup: 'register', 'sign-up': 'register', registration: 'register',
+  billpay: 'bill', payment: 'bill', bills: 'bill',
+  funds: 'fund', funding: 'fund',
+  newaccount: 'openaccount', openaccount: 'openaccount',
+  findtransaction: 'transaction', transactions: 'transaction',
+};
+
+function normalizeWord(w: string): string {
+  return SYNONYMS[w] ?? w;
+}
+
+/**
+ * Computes page-to-spec coverage locally using filtered keyword overlap.
+ *
+ * Key improvements over naive overlap:
+ *   1. Blacklist: generic banking words (account, page, bank) are excluded — they match
+ *      every spec and inflate the score without improving precision.
+ *   2. Synonym normalization: "signin" → "login", "signup" → "register", etc.
+ *   3. Normalized score: divides raw match count by page word count so pages with many
+ *      identity words (long titles) don't get false "well-covered" from 2 coincidental matches.
+ *
+ * Classification (normalized score = raw matches / distinct page keywords):
+ *   well-covered  — ≥ 0.30  (30%+ of meaningful page keywords matched a spec)
+ *   partial       — ≥ 0.08  (some signal, likely one keyword matched)
+ *   uncovered     — < 0.08  (no meaningful overlap)
+ */
+function computeLocalCoverage(
+  pages: DiscoveredPage[],
+  specs: SpecSummary[],
+): CoverageMapping[] {
+  const stripBase = (url: string) =>
+    url.replace(BASE_URL, '').replace(/\.htm$/, '').replace(/[/_-]/g, ' ').toLowerCase();
+
+  return pages.map((page) => {
+    // Collect and normalize identity words — apply blacklist and synonym map
+    const rawWords = [
+      ...stripBase(page.url).split(/\s+/),
+      ...page.title.toLowerCase().split(/\W+/),
+      ...page.navLabel.toLowerCase().split(/\W+/),
+    ];
+    const pageWords = new Set<string>(
+      rawWords
+        .filter((w) => w.length > 3 && !COVERAGE_BLACKLIST.has(w))
+        .map(normalizeWord),
+    );
+
+    if (pageWords.size === 0) {
+      // All words were blacklisted — treat as uncovered to avoid false positives
+      return { page, matchedSpecs: [], coverageLevel: 'uncovered', normalizedScore: 0 };
+    }
+
+    // Score each spec — normalize spec words through the same synonym map
+    const scoredSpecs = specs
+      .map((spec) => {
+        const specText = [
+          spec.keywords.join(' ').toLowerCase(),
+          spec.filePath.toLowerCase().replace(/[/_\\-]/g, ' '),
+        ]
+          .join(' ')
+          .split(/\W+/)
+          .filter((w) => w.length > 3 && !COVERAGE_BLACKLIST.has(w))
+          .map(normalizeWord)
+          .join(' ');
+
+        const matchScore = [...pageWords].filter((w) => specText.includes(w)).length;
+        return { filePath: spec.filePath, testCount: spec.testCount, matchScore };
+      })
+      .filter((s) => s.matchScore > 0)
+      .sort((a, b) => b.matchScore - a.matchScore);
+
+    // Normalize: raw score ÷ page word count — prevents long titles inflating coverage
+    const topScore = scoredSpecs[0]?.matchScore ?? 0;
+    const normalizedScore = topScore / pageWords.size;
+    const coverageLevel: CoverageLevel =
+      normalizedScore >= 0.30 ? 'well-covered' :
+      normalizedScore >= 0.08 ? 'partial' :
+      'uncovered';
+
+    return { page, matchedSpecs: scoredSpecs.slice(0, 2), coverageLevel, normalizedScore };
+  });
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function reportCoverage(
@@ -201,41 +304,80 @@ async function reportCoverage(
     process.exit(1);
   }
 
-  console.error(`\nDiscovered ${discovered.length} page(s), found ${specs.length} spec file(s).\n`);
+  console.error(`\nDiscovered ${discovered.length} page(s), found ${specs.length} spec file(s).`);
+  console.error('Computing local coverage mapping...\n');
 
-  // Strip the common base URL prefix — every line would otherwise repeat the full origin.
-  // Claude only needs the path to understand the page identity.
-  const stripBase = (url: string) => url.replace(BASE_URL, '/');
-
-  // Cap discovered pages sent to Claude — deep crawls of large apps can produce
-  // 50+ URLs (including query-string variants). Priority: auth pages first (higher
-  // coverage risk), then public pages. 40 is enough for complete Parabank coverage.
+  // Cap discovered pages — auth pages first (higher coverage risk), then public.
   const PAGE_CAP = 40;
   const prioritised = [
     ...discovered.filter((p) => p.requiresAuth),
     ...discovered.filter((p) => !p.requiresAuth),
   ].slice(0, PAGE_CAP);
-  const truncationNote = discovered.length > PAGE_CAP
-    ? `\n_(${discovered.length - PAGE_CAP} additional page(s) omitted — showing top ${PAGE_CAP} by auth priority)_`
-    : '';
 
-  const discoveredSection = prioritised
-    .map((p) => `- [${p.requiresAuth ? 'AUTH' : 'PUBLIC'}] ${p.navLabel} — ${stripBase(p.url)} (title: "${p.title}")`)
-    .join('\n') + truncationNote;
+  // Compute coverage locally — avoids sending all pages + all specs to Claude for mapping.
+  const mapping = computeLocalCoverage(prioritised, specs);
 
-  // Limit keywords per spec to 6 — enough for coverage mapping without token bloat
-  const specsSection = specs
-    .map(
-      (s) =>
-        `- ${s.filePath} (${s.testCount} test(s))\n  Keywords: ${s.keywords.slice(0, 6).join(', ')}`,
-    )
-    .join('\n');
+  const wellCovered = mapping.filter((m) => m.coverageLevel === 'well-covered');
+  const partial = mapping.filter((m) => m.coverageLevel === 'partial');
+  const uncovered = mapping.filter((m) => m.coverageLevel === 'uncovered');
+
+  console.error(
+    `  ✅ Well covered: ${wellCovered.length}  ` +
+    `⚠️ Partial: ${partial.length}  ` +
+    `🔴 Uncovered: ${uncovered.length}\n`,
+  );
+
+  // Cap the gap payload sent to Claude: prioritize auth pages (highest risk) and partial
+  // pages (Claude can name specific missing scenarios), then public uncovered pages.
+  // Pages beyond the cap are summarized locally as a count — Claude doesn't need to see them
+  // individually to give useful recommendations for the top-risk items.
+  const GAP_CAP = 15;
+  const stripBase = (url: string) => url.replace(BASE_URL, '/');
+
+  // Priority order: partial auth > uncovered auth > partial public > uncovered public
+  const prioritizedGaps: CoverageMapping[] = [
+    ...partial.filter((m) => m.page.requiresAuth),
+    ...uncovered.filter((m) => m.page.requiresAuth),
+    ...partial.filter((m) => !m.page.requiresAuth),
+    ...uncovered.filter((m) => !m.page.requiresAuth),
+  ];
+  const capped = prioritizedGaps.slice(0, GAP_CAP);
+  const overflow = prioritizedGaps.length - capped.length;
+
+  const buildPageLine = (m: CoverageMapping) => {
+    const tag = m.page.requiresAuth ? 'AUTH' : 'PUBLIC';
+    const status = m.coverageLevel === 'partial' ? '⚠️' : '🔴';
+    const specNote =
+      m.matchedSpecs.length > 0
+        ? ` → partial match: ${path.basename(m.matchedSpecs[0].filePath)} (${Math.round(m.normalizedScore * 100)}% overlap)`
+        : ' → no spec match';
+    return `- ${status} [${tag}] ${m.page.navLabel} — ${stripBase(m.page.url)}${specNote}`;
+  };
+
+  const overflowNote =
+    overflow > 0
+      ? `\n\n_(${overflow} additional lower-priority gap(s) omitted — focus on the above first)_`
+      : '';
+
+  const gapSection = capped.map(buildPageLine).join('\n') + overflowNote;
+
+  const coverageSummary =
+    `Total: ${prioritised.length} pages | ` +
+    `✅ Well covered: ${wellCovered.length} | ` +
+    `⚠️ Partial: ${partial.length} | ` +
+    `🔴 Uncovered: ${uncovered.length}`;
+
+  if (partial.length === 0 && uncovered.length === 0) {
+    console.log(`\n✅ ${coverageSummary} — full coverage detected, no gaps to report.`);
+    return;
+  }
 
   const userMessage =
-    `## Discovered pages and features (from live crawl)\n${discoveredSection}\n\n` +
-    `## Existing spec files and their coverage keywords\n${specsSection}`;
+    `## Coverage Summary (pre-computed locally)\n${coverageSummary}\n\n` +
+    `## Gaps requiring prioritisation (top ${capped.length} of ${prioritizedGaps.length} by risk)\n` +
+    gapSection;
 
-  console.error('Asking Claude to analyse coverage gaps...\n');
+  console.error('Asking Claude to prioritise coverage gaps...\n');
 
   const stream = await client.messages.stream({
     model: 'claude-sonnet-4-6',
@@ -250,7 +392,13 @@ async function reportCoverage(
     messages: [{ role: 'user', content: userMessage }],
   });
 
-  const fullText = await streamToStdout(stream);
+  const fullText = await streamToStdout(stream, '', {
+    pages_total: prioritised.length,
+    well_covered: wellCovered.length,
+    partial: partial.length,
+    uncovered: uncovered.length,
+    sent_to_claude: capped.length,
+  });
 
   if (outputPath) {
     const header = `# Test Coverage Report — Parabank\n_Generated: ${new Date().toISOString()}_\n\n`;
