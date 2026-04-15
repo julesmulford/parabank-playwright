@@ -36,7 +36,14 @@ docker run -p 3000:8080 parasoft/parabank
 curl -X POST http://localhost:3000/parabank/services/bank/initializeDB
 ```
 
-### 4. Run tests
+### 4. Start local Azure agent
+
+   ```bash
+   cd C:\Azure-agent
+   run.cmd
+   ```
+
+### 5. Run tests
 
 ```bash
 npx playwright test                                          # all tests
