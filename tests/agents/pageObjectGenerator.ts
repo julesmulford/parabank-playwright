@@ -46,47 +46,50 @@ Project conventions — follow exactly:
 CLASS STRUCTURE:
 - One class per page, named <PageName>Page (e.g. TransferPage, RegistrationPage)
 - Export the class
-- Export a typed data interface alongside the class if the page accepts form input (e.g. interface TransferData { fromAccount: string; toAccount: string; amount: string })
+- Export a typed data interface alongside the class if the page accepts form input
 - Constructor: constructor(private readonly page: Page)
 - All locators declared as readonly Locator properties initialised in the constructor body
 
-LOCATOR PRIORITY (highest to lowest resilience — use the highest applicable):
+LOCATOR PRIORITY (highest to lowest — use the highest applicable):
 1. this.page.getByRole('button', { name: 'Submit' })   — most resilient
 2. this.page.getByLabel('Username')                     — all labelled form inputs
 3. this.page.getByTestId('submit-btn')                  — data-testid attributes
 4. this.page.getByPlaceholder('Enter amount')           — placeholder text
 5. this.page.getByText('Forgot password?')              — visible link/button text
-6. this.page.locator('[id="customer.firstName"]')       — last resort (no semantic selector)
+6. this.page.locator('[id="customer.firstName"]')       — last resort
 
 STRICT RULES:
 - NEVER use XPath, CSS class selectors (.btn-primary), or positional selectors (nth-child)
 - NEVER put assertions (expect) inside page object methods
-- NEVER use page.waitForTimeout() — use Playwright's built-in action auto-wait
-- Methods are actions only: async fillForm(data: MyData), async submit(), async clickForgotPassword()
-- Add a goto() method: async goto() { await this.page.goto('<relative-url>'); }
+- NEVER use page.waitForTimeout()
+- Methods are actions only: async fillForm(data: MyData), async submit(), async clickLink()
 
 OUTPUT FORMAT:
-Return ONLY a JSON block. The tool assembles the TypeScript file locally — DO NOT include goto(),
-imports, class shell, constructor, or fixture notes (all generated automatically).
+Return ONLY a JSON block. goto(), imports, and class boilerplate are all assembled locally.
 
 \`\`\`json
 {
   "className": "ExamplePage",
-  "dataInterface": "export interface ExampleData { field: string; }",
+  "dataInterface": "export interface ExampleData { username: string; password: string; }",
   "locators": [
-    { "name": "submitButton", "selector": "this.page.getByRole('button', { name: 'Submit' })" },
-    { "name": "usernameInput", "selector": "this.page.getByLabel('Username')" }
+    { "name": "usernameInput", "selector": "this.page.getByLabel('Username')" },
+    { "name": "submitButton", "selector": "this.page.getByRole('button', { name: 'Submit' })" }
   ],
   "methods": [
     {
-      "name": "submit",
-      "params": "",
-      "steps": ["submitButton.click()"]
-    },
-    {
       "name": "fillForm",
       "params": "data: ExampleData",
-      "steps": ["usernameInput.fill(data.field)"]
+      "steps": [
+        { "target": "usernameInput", "action": "fill", "args": ["data.username"] },
+        { "target": "passwordInput", "action": "fill", "args": ["data.password"] }
+      ]
+    },
+    {
+      "name": "submit",
+      "params": "",
+      "steps": [
+        { "target": "submitButton", "action": "click", "args": [] }
+      ]
     }
   ]
 }
@@ -95,29 +98,36 @@ imports, class shell, constructor, or fixture notes (all generated automatically
 Rules for the JSON:
 - "dataInterface": full "export interface" string, or null if no form input
 - "locators[].selector": right-hand side ONLY — no "this.xxx =" prefix
-- "methods": each step is the action WITHOUT "await this." — the assembler adds both
-  (e.g. "usernameInput.fill(data.username)" → assembled as "await this.usernameInput.fill(data.username);")
+- "methods[].steps": each step is { target, action, args[] }
+  - "target": the locator property name (must be declared in "locators")
+  - "action": the Playwright method (fill, click, selectOption, check, press, waitFor)
+  - "args": array of argument strings passed verbatim (e.g. ["data.username"] or ["networkidle"])
+  - Assembled as: await this.<target>.<action>(<args joined by ", ">);
 - goto() is generated automatically — do NOT include it in methods
 - Choose className from the page title when it implies a clearer name than the URL slug
 - No text outside the JSON block`;
 
 // ── Local TypeScript assembler ─────────────────────────────────────────────────
 // Renders the JSON sections from Claude into a complete page object file.
-// Doing this locally avoids Claude re-emitting the entire boilerplate (imports,
-// class shell, constructor template) — saving ~30-50 output tokens per locator.
+// Structured step objects let Claude output semantic intent; TypeScript is assembled locally.
 
 interface LocatorDef {
   name: string;
   selector: string;
 }
 
-// Mini-AST for methods — Claude outputs semantic steps; the assembler renders TypeScript.
-// This eliminates "async", "await", "this.", braces, and "Promise<void>" from Claude's output,
-// saving ~10-15 tokens per step and ~40-60 tokens per method on a typical 3-step method.
+// Structured step: Claude emits { target, action, args } — assembler renders TypeScript.
+// Eliminates method-call syntax from Claude output and enables local validation.
+interface StepDef {
+  target: string;  // locator property name
+  action: string;  // Playwright method: fill, click, selectOption, check, press …
+  args: string[];  // arguments passed verbatim (e.g. ["data.username"] or ["networkidle"])
+}
+
 interface MethodDef {
   name: string;
   params: string;
-  steps: string[]; // each step WITHOUT "await this." — assembler adds both
+  steps: StepDef[];
 }
 
 interface PageObjectResult {
@@ -125,6 +135,35 @@ interface PageObjectResult {
   dataInterface: string | null;
   locators: LocatorDef[];
   methods: MethodDef[];
+}
+
+/**
+ * Validates method steps before writing:
+ *   - Rejects steps referencing undeclared locators
+ *   - Rejects goto() steps (always generated locally)
+ *
+ * Returns { valid, warnings } — caller warns and skips invalid steps rather than aborting.
+ */
+function validateSteps(
+  methods: MethodDef[],
+  locatorNames: Set<string>,
+): { valid: boolean; warnings: string[] } {
+  const warnings: string[] = [];
+  let valid = true;
+  for (const method of methods) {
+    for (const step of method.steps) {
+      if (step.action === 'goto') {
+        warnings.push(`Method "${method.name}": goto() step removed — generated automatically`);
+        valid = false;
+        continue;
+      }
+      if (step.target !== 'page' && !locatorNames.has(step.target)) {
+        warnings.push(`Method "${method.name}": target "${step.target}" not in declared locators`);
+        valid = false;
+      }
+    }
+  }
+  return { valid, warnings };
 }
 
 function assemblePageObjectFile(result: PageObjectResult, targetUrl: string): string {
@@ -135,7 +174,6 @@ function assemblePageObjectFile(result: PageObjectResult, targetUrl: string): st
   }
 
   lines.push(`export class ${result.className} {`);
-
   for (const loc of result.locators) {
     lines.push(`  readonly ${loc.name}: Locator;`);
   }
@@ -146,21 +184,23 @@ function assemblePageObjectFile(result: PageObjectResult, targetUrl: string): st
   }
   lines.push('  }');
 
-  // goto() is always generated locally from the target URL — not delegated to Claude
+  // goto() always generated locally
   const gotoUrl = new URL(targetUrl).pathname.replace(/^\/parabank\//, '');
   lines.push('', `  async goto(): Promise<void> {`);
   lines.push(`    await this.page.goto('${gotoUrl}');`);
   lines.push('  }');
 
-  // Render mini-AST methods: each step gets "await this." prefix and ";" suffix
+  // Render structured steps: { target, action, args } → await this.<target>.<action>(<args>);
+  const locatorNames = new Set(result.locators.map((l) => l.name));
   for (const method of result.methods) {
-    const body = method.steps
-      .map((step) => `    await this.${step};`)
-      .join('\n');
+    const validSteps = method.steps.filter((s) => s.action !== 'goto' && (s.target === 'page' || locatorNames.has(s.target)));
+    const body = validSteps.map((step) =>
+      `    await this.${step.target}.${step.action}(${step.args.join(', ')});`
+    ).join('\n');
     lines.push(
       '',
       `  async ${method.name}(${method.params}): Promise<void> {`,
-      body,
+      body || '    // no steps',
       '  }',
     );
   }
@@ -322,42 +362,57 @@ async function generatePageObject(
   }
   const userMessage = msgParts.join('\n\n');
 
-  // Adaptive model selection:
-  //   Simple pages (≤8 interactive elements, HTML available): Sonnet — locator choices
-  //   are straightforward when the HTML is clear and the page has few fields.
-  //   Complex pages (>8 elements OR no HTML): Opus with thinking — needs to reason
-  //   about accessibility tree structure when many elements compete, or infer structure
-  //   from URL/title alone without live HTML.
   const elementCount = html ? (html.match(/^</gm) ?? []).length : 0;
-  const useOpus = elementCount > 8 || !html;
-  const model = useOpus ? 'claude-opus-4-6' : 'claude-sonnet-4-6';
-  const maxTokens = useOpus ? 16000 : 8000;
+  // Model selection:
+  //   >8 elements with live HTML → Opus+thinking (complex accessibility tree reasoning)
+  //   ≤8 elements with HTML     → Sonnet (clear structure, straightforward locator choices)
+  //   No HTML (URL/title only)  → Sonnet-first; escalate to Opus only if JSON invalid/incomplete
+  const useOpusDirect = html.length > 0 && elementCount > 8;
+  const useSonnetFirst = html.length === 0; // no live HTML — try cheap path first
 
-  console.error(
-    `  Using ${useOpus ? 'Claude Opus (with thinking)' : 'Claude Sonnet'} ` +
-    `(${elementCount} interactive element(s) found)\n`,
-  );
+  const systemBlock = [{ type: 'text' as const, text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' as const } }];
 
-  // Opus: budget_tokens 5000 for locator reasoning; remaining ~11000 for JSON output.
-  // Sonnet: no thinking — simple forms map cleanly to the locator priority order.
-  const stream = await client.messages.stream({
-    model,
-    max_tokens: maxTokens,
-    ...(useOpus ? { thinking: { type: 'enabled', budget_tokens: 5000 } } : {}),
-    system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
-    messages: [{ role: 'user', content: userMessage }],
-  });
+  const buildRequest = (model: string, maxTokens: number, thinking?: boolean) =>
+    client.messages.stream({
+      model,
+      max_tokens: maxTokens,
+      ...(thinking ? { thinking: { type: 'enabled' as const, budget_tokens: 5000 } } : {}),
+      system: systemBlock,
+      messages: [{ role: 'user', content: userMessage }],
+    });
 
-  const fullText = await streamToStdout(stream, '', {
-    model: useOpus ? 'opus' : 'sonnet',
-    elements: elementCount,
-    html_available: html.length > 0,
-  });
+  let fullText: string;
+
+  if (useOpusDirect) {
+    console.error(`  Using Claude Opus (with thinking) — ${elementCount} elements, complex page\n`);
+    const stream = await buildRequest('claude-opus-4-6', 16000, true);
+    fullText = await streamToStdout(stream, '', { model: 'opus', elements: elementCount, html_available: true });
+  } else if (useSonnetFirst) {
+    console.error(`  No HTML — trying Claude Sonnet first (URL/title-only generation)\n`);
+    const sonnetStream = await buildRequest('claude-sonnet-4-6', 8000, false);
+    fullText = await streamToStdout(sonnetStream, '', { model: 'sonnet-first', elements: 0, html_available: false });
+    // Check if Sonnet produced a valid JSON block with required fields
+    const jsonCheck = fullText.match(/```json\n([\s\S]*?)```/);
+    let sonnetOk = false;
+    if (jsonCheck) {
+      try {
+        const parsed = JSON.parse(jsonCheck[1]) as PageObjectResult;
+        sonnetOk = !!(parsed.className && Array.isArray(parsed.locators) && Array.isArray(parsed.methods));
+      } catch { /* fall through */ }
+    }
+    if (!sonnetOk) {
+      console.error('\n⚠  Sonnet JSON invalid or incomplete — escalating to Opus+thinking...\n');
+      const opusStream = await buildRequest('claude-opus-4-6', 16000, true);
+      fullText = await streamToStdout(opusStream, '', { model: 'opus-escalated', elements: 0, html_available: false });
+    }
+  } else {
+    console.error(`  Using Claude Sonnet — ${elementCount} element(s), live HTML available\n`);
+    const stream = await buildRequest('claude-sonnet-4-6', 8000, false);
+    fullText = await streamToStdout(stream, '', { model: 'sonnet', elements: elementCount, html_available: true });
+  }
 
   if (!write) return;
 
-  // Parse the JSON sections block and assemble the TypeScript file locally.
-  // This avoids Claude re-emitting all the boilerplate (imports, class shell, constructor).
   const jsonMatch = fullText.match(/```json\n([\s\S]*?)```/);
   if (!jsonMatch) {
     console.error('⚠  Could not find JSON block in response. Review the output above.');
@@ -375,6 +430,16 @@ async function generatePageObject(
   if (!result.className || !Array.isArray(result.locators) || !Array.isArray(result.methods)) {
     console.error('⚠  JSON block is missing required fields (className, locators, methods).');
     return;
+  }
+
+  // Validate steps before assembling — reject unknown locator refs and goto() calls
+  const locatorNames = new Set(result.locators.map((l) => l.name));
+  const { valid: stepsValid, warnings: stepWarnings } = validateSteps(result.methods, locatorNames);
+  if (stepWarnings.length > 0) {
+    for (const w of stepWarnings) console.warn(`  ⚠ ${w}`);
+  }
+  if (!stepsValid) {
+    console.warn('  ⚠ Step validation failed — file assembled with invalid steps filtered out.');
   }
 
   const fileContent = assemblePageObjectFile(result, url);

@@ -26,7 +26,7 @@ export default defineConfig({
     ],
 
     use: {
-        baseURL: process.env.BASE_URL  || "http://localhost:3000/parabank/",
+        baseURL: process.env.BASE_URL  || "http://localhost:3000/parabank/services/bank/",
 
         trace: 'on-first-retry',
         screenshot: 'only-on-failure',
@@ -82,7 +82,7 @@ export default defineConfig({
             name: 'api',
             testDir: './tests/api',
             use: {
-                baseURL: 'http://localhost:3000/parabank/',
+                baseURL: 'http://localhost:3000/parabank/services/bank/',
                 extraHTTPHeaders: {
                     'Accept': 'application/json',
                     //'Authorization': `Bearer ${process.env.API_TOKEN}`,

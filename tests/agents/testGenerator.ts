@@ -87,58 +87,68 @@ function loadOrBuildPageIndex(pagesDir: string): PageIndex {
 }
 
 // ── Signature extractor for types/factories ─────────────────────────────────
-// Extracts interface/type declarations and function signatures from TypeScript files,
-// stripping function bodies. This gives Claude the type contract without the implementation,
-// reducing factory file sizes by ~60% while preserving all the information needed
-// to generate correct factory calls and type annotations.
+// Extracts ONLY exported interfaces, type aliases, and function signatures.
+// Function bodies are replaced with { /* ... */ } stubs so Claude sees the type
+// contract without implementation noise. Non-exported declarations are omitted.
 
 function extractTypeSignatures(src: string): string {
   const lines = src.split('\n');
   const out: string[] = [];
-  let skipBody = false;
-  let braceDepth = 0;
+  let mode: 'normal' | 'collect' | 'skip' = 'normal';
+  let depth = 0;
 
   for (const line of lines) {
     const trimmed = line.trim();
+    const opens = (line.match(/\{/g) ?? []).length;
+    const closes = (line.match(/\}/g) ?? []).length;
 
-    // Always include: blank lines, comments, imports, interface/type declarations
-    if (
-      !trimmed ||
-      trimmed.startsWith('//') ||
-      trimmed.startsWith('import ') ||
-      /^(export\s+)?(interface|type)\s+/.test(trimmed)
-    ) {
+    // Collecting an interface/type body — include every line verbatim
+    if (mode === 'collect') {
       out.push(line);
-      skipBody = false;
+      depth += opens - closes;
+      if (depth <= 0) { mode = 'normal'; depth = 0; out.push(''); }
       continue;
     }
 
-    // Function / const declarations — emit signature, skip body
-    if (/^(export\s+)?(async\s+)?function\s+\w+|^(export\s+)?const\s+\w+\s*=/.test(trimmed)) {
-      if (trimmed.includes('{')) {
-        // Opening brace on same line — emit stub, enter body-skip mode
-        out.push(line.replace(/\{[^}]*$/, '{ /* ... */ }'));
-        braceDepth = (line.match(/\{/g)?.length ?? 0) - (line.match(/\}/g)?.length ?? 0);
-        skipBody = braceDepth > 0;
+    // Skipping a function/const body — discard every line
+    if (mode === 'skip') {
+      depth += opens - closes;
+      if (depth <= 0) { mode = 'normal'; depth = 0; }
+      continue;
+    }
+
+    // ── mode === 'normal' — look for exported declarations only ──────────────
+
+    // Exported interface or type alias — include fully (may be multi-line)
+    if (/^export\s+(interface|type)\s+/.test(trimmed)) {
+      out.push(line);
+      depth = opens - closes;
+      if (depth > 0) mode = 'collect';
+      continue;
+    }
+
+    // Exported function — emit signature stub, skip body
+    if (/^export\s+(async\s+)?function\s+/.test(trimmed)) {
+      if (opens > 0) {
+        // Replace everything from first '{' to end of line with a stub
+        out.push(line.replace(/\s*\{.*$/, ' { /* ... */ }'));
+        depth = opens - closes;
+        if (depth > 0) mode = 'skip';
       } else {
-        // Multi-line signature (no brace yet) — include
-        out.push(line);
-        skipBody = false;
+        out.push(line); // multi-line signature, no brace yet
       }
       continue;
     }
 
-    if (skipBody) {
-      braceDepth += (line.match(/\{/g)?.length ?? 0);
-      braceDepth -= (line.match(/\}/g)?.length ?? 0);
-      if (braceDepth <= 0) {
-        skipBody = false;
-        out.push('}'); // closing brace of the stub
-      }
-      continue; // skip body lines
+    // Exported const (object, arrow function, etc.) — emit stub, skip body
+    if (/^export\s+const\s+\w+/.test(trimmed) && opens > 0) {
+      out.push(line.replace(/\s*\{.*$/, ' { /* ... */ }'));
+      depth = opens - closes;
+      if (depth > 0) mode = 'skip';
+      continue;
     }
 
-    out.push(line);
+    // Everything else (imports, non-exported declarations, comments) — omit
   }
 
   return out.join('\n');
@@ -292,7 +302,42 @@ function loadProjectContext(
     );
   }
 
-  return { context: sections.join('\n\n'), relevantPageObjectCount };
+  // ── Hard context budget ────────────────────────────────────────────────────
+  // If the assembled context exceeds ~100 KB (≈25k tokens), trim lowest-value
+  // sections first: example spec → lower-ranked page objects → long signatures.
+  // This prevents cache-busting and token overruns on large projects.
+  const CONTEXT_BUDGET = 100_000;
+  let joined = sections.join('\n\n');
+
+  if (joined.length > CONTEXT_BUDGET) {
+    // Step 1: Remove the example spec section (lowest value — conventions are clear
+    // from the system prompt; the example is only useful when context is small)
+    const exampleIdx = sections.findIndex((s) => s.includes('(example — match this style)'));
+    if (exampleIdx !== -1) {
+      sections.splice(exampleIdx, 1);
+      joined = sections.join('\n\n');
+    }
+  }
+
+  if (joined.length > CONTEXT_BUDGET) {
+    // Step 2: Drop the lowest-ranked page object (last in the top-N list)
+    // Page objects are sorted highest → lowest relevance score, so the last one is cheapest to drop.
+    const poIndices = sections.reduce<number[]>((acc, s, i) => {
+      if (s.startsWith('### tests/pages/')) acc.push(i);
+      return acc;
+    }, []);
+    if (poIndices.length > 1) {
+      sections.splice(poIndices[poIndices.length - 1], 1);
+      joined = sections.join('\n\n');
+    }
+  }
+
+  if (joined.length > CONTEXT_BUDGET) {
+    // Step 3: Hard-truncate the entire context block as a safety net
+    joined = joined.slice(0, CONTEXT_BUDGET) + '\n\n// ... (context budget exceeded — truncated)';
+  }
+
+  return { context: joined, relevantPageObjectCount };
 }
 
 // ── Static system prompt (cached — never changes) ──────────────────────────
@@ -525,14 +570,29 @@ Generate all required files. If a UI/a11y/performance test needs a new page obje
     const hasBlocks = /\/\/ tests\/[^\n]+\.ts\s*\n```typescript/.test(fullText);
     if (!hasBlocks) {
       console.error(
-        '\n⚠  Sonnet response lacked file blocks — escalating to Opus+thinking for new page object design...\n',
+        '\n⚠  Sonnet response lacked file blocks — sending retry-delta to Opus+thinking...\n',
       );
+      // Retry-delta: send Opus only the failure context + correction request, NOT the full
+      // original prompt again. The original context is cached from the Sonnet call so the
+      // L2 cache hit means we only pay for the (tiny) correction turn + Opus generation.
+      const retryMessages = [
+        ...buildMessages(),
+        { role: 'assistant' as const, content: fullText.slice(0, 2_000) }, // Sonnet's incomplete attempt
+        {
+          role: 'user' as const,
+          content:
+            'Your response above is missing the required file blocks. Each file MUST start with ' +
+            '"// tests/path/to/file.ts" on its own line, followed immediately by a ```typescript block. ' +
+            `Expected output path: ${outputPath}. ` +
+            'Please provide all required files now.',
+        },
+      ];
       const opusStream = await client.messages.stream({
         model: 'claude-opus-4-6', max_tokens: 16000,
         thinking: { type: 'enabled', budget_tokens: 8000 },
-        system: systemBlocks, messages: buildMessages(),
+        system: systemBlocks, messages: retryMessages,
       });
-      fullText = await streamToStdout(opusStream, '', { model: 'opus-escalated', po_count: 0 });
+      fullText = await streamToStdout(opusStream, '', { model: 'opus-delta', po_count: 0 });
     }
   }
 

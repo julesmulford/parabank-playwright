@@ -334,32 +334,13 @@ async function reportCoverage(
   const GAP_CAP = 15;
   const stripBase = (url: string) => url.replace(BASE_URL, '/');
 
-  // Priority order: partial auth > uncovered auth > partial public > uncovered public
+  // Initial priority order: partial auth > uncovered auth > partial public > uncovered public
   const prioritizedGaps: CoverageMapping[] = [
     ...partial.filter((m) => m.page.requiresAuth),
     ...uncovered.filter((m) => m.page.requiresAuth),
     ...partial.filter((m) => !m.page.requiresAuth),
     ...uncovered.filter((m) => !m.page.requiresAuth),
   ];
-  const capped = prioritizedGaps.slice(0, GAP_CAP);
-  const overflow = prioritizedGaps.length - capped.length;
-
-  const buildPageLine = (m: CoverageMapping) => {
-    const tag = m.page.requiresAuth ? 'AUTH' : 'PUBLIC';
-    const status = m.coverageLevel === 'partial' ? '⚠️' : '🔴';
-    const specNote =
-      m.matchedSpecs.length > 0
-        ? ` → partial match: ${path.basename(m.matchedSpecs[0].filePath)} (${Math.round(m.normalizedScore * 100)}% overlap)`
-        : ' → no spec match';
-    return `- ${status} [${tag}] ${m.page.navLabel} — ${stripBase(m.page.url)}${specNote}`;
-  };
-
-  const overflowNote =
-    overflow > 0
-      ? `\n\n_(${overflow} additional lower-priority gap(s) omitted — focus on the above first)_`
-      : '';
-
-  const gapSection = capped.map(buildPageLine).join('\n') + overflowNote;
 
   const coverageSummary =
     `Total: ${prioritised.length} pages | ` +
@@ -372,10 +353,86 @@ async function reportCoverage(
     return;
   }
 
+  // ── Local risk scoring ─────────────────────────────────────────────────────
+  // Assign a risk tier to each gap so Claude only writes scenario suggestions,
+  // not the ordering (we've already done that work locally).
+  const MONEY_KEYWORDS = ['transfer', 'bill', 'payment', 'loan', 'openaccount', 'fund', 'deposit', 'withdraw'];
+
+  function riskTier(m: CoverageMapping): 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' {
+    const nav = m.page.navLabel.toLowerCase();
+    const url = m.page.url.toLowerCase();
+    const hasMoney = MONEY_KEYWORDS.some((k) => nav.includes(k) || url.includes(k));
+    if (m.page.requiresAuth && hasMoney) return 'CRITICAL';
+    if (m.page.requiresAuth) return 'HIGH';
+    if (/register|login|password|forgot/.test(nav + url)) return 'MEDIUM';
+    return 'LOW';
+  }
+
+  // Re-sort prioritized gaps by risk tier (CRITICAL → HIGH → MEDIUM → LOW)
+  const RISK_ORDER = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
+  const riskSortedGaps = [...prioritizedGaps].sort(
+    (a, b) => RISK_ORDER[riskTier(a)] - RISK_ORDER[riskTier(b)],
+  );
+  const cappedRisk = riskSortedGaps.slice(0, GAP_CAP);
+  const overflowRisk = riskSortedGaps.length - cappedRisk.length;
+
+  // ── No-Claude path for small, low-risk gap sets ────────────────────────────
+  // If there are ≤3 gaps and none are CRITICAL or HIGH risk, emit a deterministic
+  // local report. Claude's value is scenario depth + risk ordering — neither adds
+  // material value when the gap set is tiny and all pages are low-risk informational.
+  const hasHighRisk = riskSortedGaps.some((m) => ['CRITICAL', 'HIGH'].includes(riskTier(m)));
+  if (riskSortedGaps.length <= 3 && !hasHighRisk) {
+    console.error('  ✓ Small low-risk gap set — generating deterministic report (no Claude call)\n');
+    const localLines = riskSortedGaps.map((m) => {
+      const risk = riskTier(m);
+      const status = m.coverageLevel === 'partial' ? '⚠️' : '🔴';
+      const tag = m.page.requiresAuth ? 'AUTH' : 'PUBLIC';
+      return (
+        `**${m.page.navLabel}** [${tag}][${risk}] — ${stripBase(m.page.url)}\n` +
+        `Risk: ${risk}\n` +
+        `Why: Low-risk informational page — missing basic smoke coverage.\n` +
+        `Suggest: \`npx tsx tests/agents/testGenerator.ts --feature "${m.page.navLabel.toLowerCase()}" --type ui\`\n`
+      );
+    });
+    const localReport =
+      `## Coverage Summary\n${coverageSummary}\n\n` +
+      `## ${riskSortedGaps[0]?.coverageLevel === 'partial' ? '⚠️ Partially Covered' : '🔴 Not Covered — Priority Order'}\n` +
+      localLines.join('\n') +
+      `\n\n## Recommended Next Sprint\n` +
+      riskSortedGaps.slice(0, 3).map((m, i) =>
+        `${i + 1}. \`tests/${m.page.requiresAuth ? 'ui' : 'ui'}/${m.page.navLabel.toLowerCase().replace(/\s+/g, '-')}.spec.ts\``
+      ).join('\n');
+    process.stdout.write(localReport + '\n');
+    if (outputPath) {
+      fs.writeFileSync(outputPath, `# Test Coverage Report — Parabank\n_Generated: ${new Date().toISOString()} | Mode: local_\n\n` + localReport, 'utf-8');
+      console.error(`✓ Report saved to: ${outputPath}`);
+    }
+    return;
+  }
+
+  const buildPageLine = (m: CoverageMapping) => {
+    const tag = m.page.requiresAuth ? 'AUTH' : 'PUBLIC';
+    const risk = riskTier(m);
+    const status = m.coverageLevel === 'partial' ? '⚠️' : '🔴';
+    const specNote =
+      m.matchedSpecs.length > 0
+        ? ` → partial match: ${path.basename(m.matchedSpecs[0].filePath)} (${Math.round(m.normalizedScore * 100)}% overlap)`
+        : ' → no spec match';
+    return `- ${status} [${tag}][${risk}] ${m.page.navLabel} — ${stripBase(m.page.url)}${specNote}`;
+  };
+
+  const overflowNote =
+    overflowRisk > 0
+      ? `\n\n_(${overflowRisk} additional lower-priority gap(s) omitted — focus on the above first)_`
+      : '';
+
+  const gapSectionRisk = cappedRisk.map(buildPageLine).join('\n') + overflowNote;
+
   const userMessage =
     `## Coverage Summary (pre-computed locally)\n${coverageSummary}\n\n` +
-    `## Gaps requiring prioritisation (top ${capped.length} of ${prioritizedGaps.length} by risk)\n` +
-    gapSection;
+    `## Gaps — pre-sorted by risk tier (CRITICAL → HIGH → MEDIUM → LOW)\n` +
+    `Risk tiers are already computed. Your job: write concrete scenario suggestions and a sprint plan.\n\n` +
+    gapSectionRisk;
 
   console.error('Asking Claude to prioritise coverage gaps...\n');
 
@@ -397,7 +454,7 @@ async function reportCoverage(
     well_covered: wellCovered.length,
     partial: partial.length,
     uncovered: uncovered.length,
-    sent_to_claude: capped.length,
+    sent_to_claude: cappedRisk.length,
   });
 
   if (outputPath) {

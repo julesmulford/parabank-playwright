@@ -212,15 +212,18 @@ function reduceToFailureWindow(trace: ParsedTrace, traceFile: string): string {
   );
   if (windowStart > 0) lines.push(`... (${windowStart} earlier action(s) omitted)`);
 
+  // Helper: truncate a value string to avoid single long params bloating the payload
+  const capStr = (s: string, max: number) => s.length > max ? s.slice(0, max) + '…' : s;
+
   for (const a of windowActions) {
     const ts = a.startTime ? new Date(a.startTime).toISOString().slice(11, 23) : '??';
     const paramStr = a.params
       ? Object.entries(a.params)
-          .slice(0, 3)
-          .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+          .slice(0, 2) // reduced from 3 → 2: third param rarely adds diagnostic signal
+          .map(([k, v]) => `${k}=${capStr(JSON.stringify(v), 60)}`)
           .join(', ')
       : '';
-    const errStr = a.error ? ` ❌ ERROR: ${a.error.message}` : '';
+    const errStr = a.error ? ` ❌ ${capStr(a.error.message ?? '', 120)}` : '';
     lines.push(`[${ts}] ${a.apiName}(${paramStr})${errStr}`);
   }
 
@@ -229,33 +232,33 @@ function reduceToFailureWindow(trace: ParsedTrace, traceFile: string): string {
   const nearbyNetwork =
     failureTime > 0
       ? trace.networkEvents.filter((n) => Math.abs((n.time ?? 0) - failureTime) <= NETWORK_WINDOW_MS)
-      : trace.networkEvents.slice(-10);
+      : trace.networkEvents.slice(-8);
 
   if (nearbyNetwork.length > 0) {
-    lines.push('', `## Network Events (within ±2 s of failure — ${nearbyNetwork.length} event(s))`);
-    for (const n of nearbyNetwork.slice(0, 15)) {
+    lines.push('', `## Network (±2 s of failure — ${nearbyNetwork.length} event(s))`);
+    for (const n of nearbyNetwork.slice(0, 10)) {
       const ts = n.time ? new Date(n.time).toISOString().slice(11, 23) : '??';
       const params = n.params as Record<string, unknown> | undefined;
-      const url = String(params?.['url'] ?? params?.['response'] ?? '');
+      const rawUrl = String(params?.['url'] ?? params?.['response'] ?? '');
+      const url = capStr(rawUrl, 100); // cap long URLs — query strings rarely add signal
       const status = params?.['status'] ? ` [${params['status']}]` : '';
       const method = params?.['method'] ? ` ${params['method']}` : '';
       lines.push(`[${ts}] ${n.method}${method}${status} ${url}`);
     }
   }
 
-  // Deduplicated errors — repeated timeout messages are a single root cause;
-  // sending 10 identical lines wastes tokens without adding diagnostic signal.
+  // Deduplicated errors — cap message length to avoid stack traces consuming the budget
   const ERROR_CAP = 5;
   if (trace.errors.length > 0) {
-    lines.push('', '## Errors / Exceptions');
+    lines.push('', '## Errors');
     const seen = new Set<string>();
     let printed = 0;
     for (const e of trace.errors) {
-      const key = e.message.slice(0, 120); // deduplicate by first 120 chars
+      const key = e.message.slice(0, 120);
       if (seen.has(key)) continue;
       seen.add(key);
       const ts = e.time ? new Date(e.time).toISOString().slice(11, 23) : '??';
-      lines.push(`[${ts}] ${e.message}`);
+      lines.push(`[${ts}] ${capStr(e.message, 200)}`); // cap at 200 — stack traces truncated
       if (++printed >= ERROR_CAP) {
         const remaining = trace.errors.length - printed;
         if (remaining > 0) lines.push(`... (${remaining} additional error(s) deduplicated)`);
@@ -360,14 +363,20 @@ function buildDeterministicDiagnosis(trace: ParsedTrace, traceFile: string): str
     .filter((a) => a.type === 'before' && a.apiName && a.error)
     .at(0);
 
-  // Only produce local diagnosis for clearly self-explanatory error patterns
+  // Only produce local diagnosis for clearly self-explanatory error patterns.
+  // Patterns are conservative — prefer false negatives (fall through to Claude)
+  // over false positives (wrong local diagnosis).
   const DIAGNOSABLE = [
-    { pattern: /timeout.*exceeded|waiting.*timeout/i, category: 'Race condition / selector timing' },
-    { pattern: /locator.*resolved.*to\s+\d+\s+element|strict mode.*resolved/i, category: 'Broken locator — multiple matches' },
-    { pattern: /element.*not.*visible|element.*outside.*viewport/i, category: 'Element state issue' },
-    { pattern: /no elements match|unable to find element/i, category: 'Broken locator — no match' },
-    { pattern: /net::ERR_|navigat.*failed|ERR_CONNECTION/i, category: 'Network failure' },
-    { pattern: /page\.close|target closed/i, category: 'Page closed unexpectedly' },
+    { pattern: /timeout.*exceeded|waiting.*timeout|Timeout \d+ms exceeded/i, category: 'Race condition / selector timing' },
+    { pattern: /locator.*resolved.*to\s+\d+\s+element|strict mode.*resolved to \d+/i, category: 'Broken locator — multiple matches' },
+    { pattern: /element.*not.*visible|element.*outside.*viewport|not visible/i, category: 'Element state issue' },
+    { pattern: /no elements match|unable to find element|locator\..*resolve.*0 elements/i, category: 'Broken locator — no match' },
+    { pattern: /net::ERR_|navigat.*failed|ERR_CONNECTION_REFUSED|ERR_NAME_NOT_RESOLVED/i, category: 'Network failure' },
+    { pattern: /page\.close|Target closed|browser.*closed/i, category: 'Page closed unexpectedly' },
+    { pattern: /AssertionError|expect\(received\)\.to|Error: Expected/i, category: 'Assertion failure' },
+    { pattern: /frame.*detached|execution context.*destroyed|context was destroyed/i, category: 'Navigation race condition' },
+    { pattern: /Response status code does not indicate success: [45]\d\d/i, category: 'API / HTTP error response' },
+    { pattern: /Could not find.*role|getByRole.*did not find|No accessible element/i, category: 'ARIA role mismatch' },
   ];
 
   const matched = DIAGNOSABLE.find(({ pattern }) => pattern.test(error.message));
@@ -408,6 +417,22 @@ function buildDeterministicDiagnosis(trace: ParsedTrace, traceFile: string): str
     if (/net::ERR_/i.test(error.message)) return [
       '1. **Immediate**: Verify the app is running at `BASE_URL` and the DB is initialised',
       '2. **Long-term**: Add a health-check step in `beforeAll` that fails fast with a clear message',
+    ];
+    if (/AssertionError|expect\(received\)/i.test(error.message)) return [
+      '1. **Immediate**: Check the assertion value — the app state may have changed (e.g. different text, different balance)',
+      '2. **Long-term**: Assert on data shape/type rather than exact values when content is dynamic',
+    ];
+    if (/frame.*detached|execution context.*destroyed/i.test(error.message)) return [
+      '1. **Immediate**: Add `await page.waitForLoadState(\'networkidle\')` before interacting after navigation',
+      '2. **Long-term**: Avoid storing references to elements across navigation boundaries — re-query after each goto()',
+    ];
+    if (/Response status code does not indicate success/i.test(error.message)) return [
+      '1. **Immediate**: Check the API endpoint URL and authentication headers — the server returned 4xx/5xx',
+      '2. **Long-term**: Add a `beforeAll` health-check that calls the endpoint and fails fast with a readable message',
+    ];
+    if (/Could not find.*role|getByRole|No accessible/i.test(error.message)) return [
+      '1. **Immediate**: Run the locator healer: `npx tsx tests/agents/locatorHealer.ts --page <PageObject.ts>`',
+      '2. **Long-term**: Prefer `getByLabel` or `getByTestId` on elements where ARIA roles are ambiguous or missing',
     ];
     return [
       '1. **Immediate**: Run with `--trace on` and inspect with `npx playwright show-trace`',

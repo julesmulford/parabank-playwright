@@ -263,22 +263,24 @@ function filterHtmlToLocatorContext(html: string, locatorExtract: string): strin
 /**
  * Attempts deterministic rule-based locator upgrades without calling Claude.
  *
- * Rules:
+ * Rules applied (in priority order):
  *   R1: locator('[id="X"]') + <label for="X">text → getByLabel('text')
- *   R2: getByText('text') where HTML has <button>…text… → getByRole('button', { name: 'text' })
+ *   R2: locator('[id="X"]') + <input placeholder="…"> → getByPlaceholder('…')
+ *   R3: getByText('text') where HTML has <button>…text → getByRole('button', { name })
+ *   R4: locator('[data-testid="X"]') → getByTestId('X')
+ *   R5: locator('[id="X"]') where input has no label but has placeholder → getByPlaceholder
  *
  * Returns { replacements, allHandled }:
- *   - replacements: the rule-generated Replacement objects
- *   - allHandled: true when every sub-optimal locator was covered by a rule
- *                 (caller skips Claude when true and replacements.length > 0)
+ *   - replacements: rule-generated Replacement objects (already validated)
+ *   - allHandled: true when every sub-optimal locator was covered — caller skips Claude
  */
 function preclassifyLocators(
   locatorExtract: string,
   html: string,
 ): { replacements: Replacement[]; allHandled: boolean } {
-  // Sub-optimal locators: those using locator('[id=...]') or getByText
+  // Sub-optimal tiers: locator('[id=...]'), locator('[data-testid=...]'), getByText
   const subOptimalRe =
-    /^( {0,8}this\.\w+\s*=\s*this\.page\.(?:locator\s*\(\s*['"][^'"]*\[id=|getByText\s*\()[^\n;]+;)/gm;
+    /^( {0,8}this\.\w+\s*=\s*this\.page\.(?:locator\s*\(\s*['"][^'"]*(?:\[id=|\[data-testid=)|getByText\s*\()[^\n;]+;)/gm;
   const subOptimal = [...locatorExtract.matchAll(subOptimalRe)].map(([line]) => line);
 
   if (subOptimal.length === 0) return { replacements: [], allHandled: true };
@@ -287,28 +289,60 @@ function preclassifyLocators(
   let unhandledCount = 0;
 
   for (const line of subOptimal) {
-    // R1: locator('[id="X"]') + <label for="X">text</label> → getByLabel('text')
+    // R4: locator('[data-testid="X"]') → getByTestId('X') — no HTML needed
+    const testidMatch = line.match(/locator\s*\(\s*['"][^'"]*\[data-testid=["']?([^"'\]]+)["']?\]['"]\s*\)/);
+    if (testidMatch) {
+      const testid = testidMatch[1];
+      const replacement = line.replace(
+        /this\.page\.locator\s*\(\s*['"][^'"]*\[data-testid=["']?[^"'\]]+["']?\]['"]\s*\)/,
+        `this.page.getByTestId('${testid}')`,
+      );
+      replacements.push({ original: line, replacement, reason: `data-testid="${testid}" → getByTestId (semantic, no HTML scan needed)` });
+      continue;
+    }
+
+    // For id-based selectors, need HTML to know which upgrade applies
     const idMatch = line.match(/locator\s*\(\s*['"][^'"]*\[id=["']?([^"'\]]+)["']?\]['"]\s*\)/);
-    if (idMatch && html) {
+    if (idMatch) {
       const fieldId = idMatch[1];
-      const labelRe = new RegExp(`<label[^>]*\\bfor=["']?${fieldId}["']?[^>]*>([^<]+)<`, 'i');
-      const labelMatch = html.match(labelRe);
-      if (labelMatch) {
-        const labelText = labelMatch[1].trim();
-        const replacement = line.replace(
-          /this\.page\.locator\s*\(\s*['"][^'"]*\[id=["']?[^"'\]]+["']?\]['"]\s*\)/,
-          `this.page.getByLabel('${labelText}')`,
-        );
-        replacements.push({
-          original: line,
-          replacement,
-          reason: `Label "${labelText}" found for id="${fieldId}" — getByLabel is more resilient than id selector`,
-        });
-        continue;
+
+      // R1: <label for="fieldId">text</label> → getByLabel('text')
+      if (html) {
+        const labelRe = new RegExp(`<label[^>]*\\bfor=["']?${fieldId}["']?[^>]*>([^<]+)<`, 'i');
+        const labelMatch = html.match(labelRe);
+        if (labelMatch) {
+          const labelText = labelMatch[1].trim();
+          const replacement = line.replace(
+            /this\.page\.locator\s*\(\s*['"][^'"]*\[id=["']?[^"'\]]+["']?\]['"]\s*\)/,
+            `this.page.getByLabel('${labelText}')`,
+          );
+          replacements.push({
+            original: line, replacement,
+            reason: `Label "${labelText}" found for id="${fieldId}" — getByLabel is more resilient`,
+          });
+          continue;
+        }
+
+        // R2 / R5: <input id="fieldId" placeholder="…"> → getByPlaceholder('…')
+        const inputRe = new RegExp(`<input[^>]*\\bid=["']?${fieldId}["']?[^>]*placeholder=["']([^"']+)["']`, 'i');
+        const inputRevRe = new RegExp(`<input[^>]*placeholder=["']([^"']+)["'][^>]*\\bid=["']?${fieldId}["']?`, 'i');
+        const placeholderMatch = html.match(inputRe) ?? html.match(inputRevRe);
+        if (placeholderMatch) {
+          const placeholder = placeholderMatch[1].trim();
+          const replacement = line.replace(
+            /this\.page\.locator\s*\(\s*['"][^'"]*\[id=["']?[^"'\]]+["']?\]['"]\s*\)/,
+            `this.page.getByPlaceholder('${placeholder}')`,
+          );
+          replacements.push({
+            original: line, replacement,
+            reason: `input id="${fieldId}" has placeholder="${placeholder}" — getByPlaceholder is more readable`,
+          });
+          continue;
+        }
       }
     }
 
-    // R2: getByText('text') + <button> containing that text → getByRole('button', { name })
+    // R3: getByText('text') + <button> in HTML → getByRole('button', { name })
     const textMatch = line.match(/getByText\s*\(\s*['"]([^'"]+)['"]\s*\)/);
     if (textMatch && html) {
       const text = textMatch[1];
@@ -319,15 +353,14 @@ function preclassifyLocators(
           (_m, t: string) => `this.page.getByRole('button', { name: '${t}' })`,
         );
         replacements.push({
-          original: line,
-          replacement,
-          reason: `"${text}" is a <button> element — getByRole('button') is more resilient than getByText`,
+          original: line, replacement,
+          reason: `"${text}" is a <button> — getByRole('button') is more resilient than getByText`,
         });
         continue;
       }
     }
 
-    // Rule could not handle this locator
+    // No rule matched — Claude required for this locator
     unhandledCount++;
   }
 
@@ -445,9 +478,53 @@ async function healPageObject(
   const locatorExtract = extractLocatorSection(originalSrc, pageObjectPath);
 
   // Filter HTML to only elements relevant to the current locator assignments.
-  // Sending all extracted interactive elements would include unrelated links and widgets
-  // that add tokens without improving locator audit quality.
   const filteredHtml = html ? filterHtmlToLocatorContext(html, locatorExtract) : '';
+
+  // ── Stage 0: deterministic preclassification ──────────────────────────────
+  // Apply rule-based upgrades (label-for, placeholder, testid, button-role) before
+  // reaching for Claude. If every sub-optimal locator is handled by a rule, skip the
+  // API call entirely — zero tokens spent, zero latency.
+  const locatorCount = (originalSrc.match(/this\.page\./g) ?? []).length;
+  const { replacements: localReplacements, allHandled } = preclassifyLocators(locatorExtract, filteredHtml || html);
+
+  if (allHandled && localReplacements.length > 0) {
+    console.error(`  ✓ All ${localReplacements.length} locator(s) upgraded locally (no Claude call)\n`);
+    console.error(`\n  ${localReplacements.length} improvement(s) found (deterministic):`);
+    for (const r of localReplacements) {
+      console.error(`    - ${r.reason}`);
+      console.error(`      was: ${r.original.trim()}`);
+      console.error(`      now: ${r.replacement.trim()}`);
+    }
+    if (apply) {
+      const valid = validateReplacements(localReplacements);
+      let updated = originalSrc;
+      let applied = 0;
+      for (const r of valid) {
+        if (updated.includes(r.original)) {
+          updated = updated.replace(r.original, r.replacement);
+          applied++;
+        } else {
+          console.warn(`  ⚠ Could not find exact match for: ${r.original.trim()}`);
+        }
+      }
+      if (applied > 0) {
+        printDiff(originalSrc, updated);
+        fs.writeFileSync(pageObjectPath, updated, 'utf-8');
+        console.error(`  ✓ Applied ${applied} deterministic change(s) to ${pageObjectPath}`);
+      }
+    }
+    return;
+  }
+
+  if (allHandled && localReplacements.length === 0) {
+    console.error('  ✓ All locators already optimal — no changes needed (no Claude call)');
+    return;
+  }
+
+  // Some locators need Claude reasoning — proceed with API call for the remainder
+  if (localReplacements.length > 0) {
+    console.error(`  ℹ ${localReplacements.length} locator(s) upgraded locally; ${locatorCount - localReplacements.length} require Claude reasoning`);
+  }
 
   const userMessage =
     `## Locator audit: ${pageObjectPath}\n` +
@@ -459,35 +536,24 @@ async function healPageObject(
       : '<!-- Live HTML unavailable — static analysis only -->');
 
   // Adaptive model selection:
-  //   Live HTML + high locator count (≥8) → Opus+thinking. The combination of many
-  //   locators and a live page creates the structural-reasoning challenge that Opus excels at.
-  //   Everything else (no HTML, or HTML with few locators) → Sonnet is sufficient.
-  //   Using OR here previously escalated to Opus for any page with live HTML, even trivial
-  //   3-locator pages — a significant over-spend given the HTML is already filtered.
-  const locatorCount = (originalSrc.match(/this\.page\./g) ?? []).length;
+  //   Live HTML + high locator count (≥8) → Opus+thinking.
+  //   Everything else → Sonnet is sufficient.
   const useOpus = locatorCount >= 8 && html.length > 0;
   const model = useOpus ? 'claude-opus-4-6' : 'claude-sonnet-4-6';
-  const maxTokens = useOpus ? 16000 : 8000;
+  // Sonnet max_tokens reduced to 2500: JSON-only output with ~10-15 replacements
+  // averages ~600-800 tokens. 2500 provides headroom without over-allocating.
+  const maxTokens = useOpus ? 16000 : 2500;
 
   console.error(
     `  Asking ${useOpus ? 'Claude Opus (with thinking)' : 'Claude Sonnet'} to audit locators` +
     ` (${locatorCount} locator(s) found)...\n`,
   );
 
-  // Opus: max_tokens covers thinking + text output combined.
-  //   budget_tokens: 5000 for reasoning; remaining ~11000 for healed file + diff summary.
-  // Sonnet: no thinking — simple page objects map cleanly to the priority order.
   const stream = await client.messages.stream({
     model,
     max_tokens: maxTokens,
     ...(useOpus ? { thinking: { type: 'enabled', budget_tokens: 5000 } } : {}),
-    system: [
-      {
-        type: 'text',
-        text: SYSTEM_PROMPT,
-        cache_control: { type: 'ephemeral' },
-      },
-    ],
+    system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
     messages: [{ role: 'user', content: userMessage }],
   });
 
@@ -495,10 +561,10 @@ async function healPageObject(
     locators: locatorCount,
     html_present: filteredHtml.length > 0,
     model: useOpus ? 'opus' : 'sonnet',
+    local_pre: localReplacements.length,
   });
 
   // Parse JSON and print a human-readable summary regardless of --apply.
-  // Claude outputs only JSON (no prose preamble), so we render it here for the user.
   {
     const previewMatch = fullText.match(/```json\n([\s\S]*?)```/);
     if (previewMatch) {
@@ -507,7 +573,7 @@ async function healPageObject(
           replacements: Array<{ original: string; replacement: string; reason: string }>;
         };
         if (replacements.length === 0) {
-          console.error('  ✓ All locators are optimal — no changes needed.');
+          console.error('  ✓ All remaining locators are optimal — no further changes needed.');
         } else {
           console.error(`\n  ${replacements.length} improvement(s) found:`);
           for (const r of replacements) {
@@ -521,23 +587,23 @@ async function healPageObject(
   }
 
   if (apply) {
-    // Parse the JSON replacements block and apply each substitution locally.
-    // This avoids asking Claude to regenerate the entire file — a far cheaper output shape.
     const jsonMatch = fullText.match(/```json\n([\s\S]*?)```/);
     if (!jsonMatch) {
       console.warn('  ⚠ Could not find JSON replacements block — nothing written.');
       return;
     }
     try {
-      const { replacements } = JSON.parse(jsonMatch[1]) as {
+      const { replacements: claudeReplacements } = JSON.parse(jsonMatch[1]) as {
         replacements: Array<{ original: string; replacement: string; reason: string }>;
       };
-      if (replacements.length === 0) {
+
+      // Merge local (preclassified) and Claude replacements — validate the combined set
+      const allReplacements = [...localReplacements, ...claudeReplacements];
+      if (allReplacements.length === 0) {
         console.error('  ✓ No changes required — file unchanged.');
         return;
       }
-      // Validate before applying: reject no-ops, duplicates, and disallowed selectors
-      const validReplacements = validateReplacements(replacements);
+      const validReplacements = validateReplacements(allReplacements);
       if (validReplacements.length === 0) {
         console.warn('  ⚠ All replacements were rejected by validation — nothing written.');
         return;
@@ -546,8 +612,6 @@ async function healPageObject(
       let applied = 0;
       for (const r of validReplacements) {
         if (updated.includes(r.original)) {
-          // replace() with a string (not regex) replaces the first occurrence only —
-          // correct behaviour since duplicate locator lines are a convention violation.
           updated = updated.replace(r.original, r.replacement);
           applied++;
         } else {
