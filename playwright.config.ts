@@ -81,6 +81,7 @@ export default defineConfig({
         {
             name: 'api',
             testDir: './tests/api',
+            fullyParallel: false, // Parabank DB cannot handle concurrent registrations
             use: {
                 baseURL: 'http://localhost:3000/parabank/services/bank/',
                 extraHTTPHeaders: {

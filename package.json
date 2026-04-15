@@ -9,6 +9,7 @@
         "test:debug": "playwright test --debug",
         "test:smoke": "playwright test --grep @smoke",
         "report": "playwright show-report",
+        "test:api": "playwright test --project=api --workers=1",
         "test:chromium": "playwright test --project=chromium",
         "test:firefox": "playwright test --project=firefox",
         "test:webkit": "playwright test --project=webkit",
